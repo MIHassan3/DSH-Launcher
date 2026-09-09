@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+dist/
+
+# Logs
+*.log
+
+# User-specific settings (if any)
+*.user
+*.suo
+
+# Node modules (if you ever include the runtime)
+node_modules/
+
+# IDE folders (optional)
+.vs/
+.vscode/
