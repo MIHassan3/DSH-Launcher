@@ -41,12 +41,18 @@ The [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) is a powe
 - **Switching channels**: On the alpha channel, a reminder appears on every start, allowing you to pick a stable version again.
 - **Settings**: The launcher stores its settings in `%LOCALAPPDATA%\DeepSeekHarness\settings.json`. You can edit it manually if needed (e.g., set `"channel": "latest"` or `"skipVersion": "1.2.3"`).
 
-## Building from Source
+## Troubleshooting
+- **“Node.js / npm was not found on PATH”**
+Install Node.js from nodejs.org or re‑run the installer and choose to install it.
 
-If you want to build the installer yourself:
+- **“The harness did not report a URL”**
+This usually means the first‑run profile build failed. Close the app and relaunch – it often succeeds on the second attempt. If it persists, check the logs in %LOCALAPPDATA%\DeepSeekHarness\.
 
-1. Clone this repository.
-2. Install the required tools:
-   ```powershell
-   Install-Module ps2exe -Scope CurrentUser
-   winget install JRSoftware.InnoSetup
+- **“Could not clear the old runtime – files are still locked”**
+A previous harness process is still running. Open Task Manager, end all node.exe processes, then relaunch.
+
+## License
+This project is licensed under the MIT License – see the LICENSE file for details.
+
+## Disclaimer
+This launcher is an independent project and is not affiliated with or endorsed by DeepSeek. The DeepSeek Harness is a separate open‑source tool.
