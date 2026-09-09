@@ -15,3 +15,7 @@ node_modules/
 # IDE folders (optional)
 .vs/
 .vscode/
+
+# Windows folder artifacts
+desktop.ini
+Thumbs.db

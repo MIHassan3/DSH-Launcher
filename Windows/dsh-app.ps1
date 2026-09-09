@@ -11,21 +11,33 @@ if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
 }
 
 # ==== configuration ========================================================
-$DefaultChannel = 'latest'   # 'latest' (stable line) or 'alpha'
-$Port     = 8765             # pinned: keeps the Edge PWA identity stable
+$DefaultChannel = 'latest'   # 'latest' (release line) or 'alpha'
+$DefaultPort    = 8765       # pinned: keeps the Edge PWA identity stable
 $Mode     = 'edge-app'       # 'edge-app' | 'pwa' | 'browser'
 $PwaName  = 'DeepSeek Harness'
 $Package  = '@deepseek-ai/dsh'
-$DialogTimeout = 3           # seconds before a dialog dismisses itself; 0 = never
+$DialogTimeout = 4           # seconds before the status card dismisses itself; 0 = never
 # dsh builds its plugin tree during the first served session after an install,
 # and that reload drops the open page ("connecting... disconnected"). It only
 # happens when the profile in $DSH_HOME has to be built - which is every new
 # machine. Prompting for one restart after an install is the reliable remedy.
 $PromptRestartAfterInstall = $true
 # $env:DSH_HOME = 'C:\Users\me\.dsh'   # uncomment to isolate this app's profile
+#
+# Isolated test mode: every path below is derived from $DataDir, so pointing
+# DSH_DATA_DIR (and DSH_HOME for the dsh profile, DSH_PORT for the server) at
+# private folders runs this launcher against its own copy of everything and
+# never touches the default install:
+#   $env:DSH_DATA_DIR = 'C:\temp\DSHLauncher-Test\data'
+#   $env:DSH_HOME     = 'C:\temp\DSHLauncher-Test\dsh-home'
+#   $env:DSH_PORT     = '8877'
+# The single-instance lock and the orphan cleanup follow $DataDir too, so a
+# test copy and the real install never see each other's processes or data.
+$DataDir = if ($env:DSH_DATA_DIR) { $env:DSH_DATA_DIR.Trim() } else { Join-Path $env:LOCALAPPDATA 'DeepSeekHarness' }
+$Port    = if ($env:DSH_PORT -match '^\d+$') { [int]$env:DSH_PORT } else { $DefaultPort }
 # ===========================================================================
 
-$appDir       = Join-Path $env:LOCALAPPDATA 'DeepSeekHarness'
+$appDir       = $DataDir
 $runtimeDir   = Join-Path $appDir 'runtime'
 $profileDir   = Join-Path $appDir 'edge-profile'
 $outLog       = Join-Path $appDir 'dsh.out.log'
@@ -38,6 +50,177 @@ $profileRoot  = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERP
 $webProfile   = Join-Path $profileRoot 'profiles\web'
 
 New-Item -ItemType Directory -Force -Path $appDir, $runtimeDir, $profileDir | Out-Null
+
+# Any unexpected terminating error is logged to crash.log and surfaced in a
+# popup instead of silently killing the windowless app.
+trap {
+    $tmsg = ''
+    try { $tmsg = [string]$_.Exception.Message } catch { }
+    $tline = 0
+    try { $tline = $_.InvocationInfo.ScriptLineNumber } catch { }
+    try {
+        Add-Content (Join-Path $appDir 'crash.log') ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  line ' + $tline + '  ' + $tmsg)
+    } catch { }
+    try {
+        if ($splash -and -not $splash.IsDisposed) { $splash.Close() }
+        if ($shell) {
+            $shell.Popup('Unexpected error: ' + $tmsg + "`n(line " + $tline + ')`n`nDetails were written to:`n' + (Join-Path $appDir 'crash.log'), 0, 'DeepSeek Harness', 16) | Out-Null
+        }
+    } catch { }
+    exit 1
+}
+
+# ==== process ownership ====================================================
+# Cleanup is scoped to THIS data dir: only processes whose command line runs
+# a dsh from $runtimeDir are considered ours. A second install (or a test
+# copy) under another data dir is never touched.
+function Get-OwnedHarnessProcesses {
+    Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$runtimeDir*" }
+}
+
+function Stop-OrphanHarness {
+    Get-OwnedHarnessProcesses |
+        ForEach-Object { Invoke-KillTree $_.ProcessId }
+}
+
+function Stop-Harness {
+    if ($harness -and -not $harness.HasExited) {
+        Invoke-KillTree $harness.Id
+    }
+    Stop-OrphanHarness   # catch any child that outlived its parent
+}
+
+# Kill a process and its children tolerantly. taskkill failures (e.g. a child
+# that is already exiting or protected) must never become terminating errors,
+# so the kill goes through Start-Process and is retried once, then ignored.
+function Invoke-KillTree([int]$procId) {
+    if (-not $procId) { return }
+    $tk = Join-Path $env:windir 'System32\taskkill.exe'
+    for ($try = 0; $try -lt 2; $try++) {
+        try {
+            Start-Process -FilePath $tk -ArgumentList @('/PID', "$procId", '/T', '/F') -WindowStyle Hidden -Wait | Out-Null
+        } catch { }
+        Start-Sleep -Milliseconds 500
+        if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) { return }
+    }
+}
+
+function Test-PortFree($p) {
+    try {
+        $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $p)
+        $l.Start(); $l.Stop(); $true
+    } catch { $false }
+}
+
+function Get-ProfilePluginCount {
+    @(Get-ChildItem (Join-Path $webProfile 'node_modules\@deepseek-ai') -ErrorAction SilentlyContinue).Count
+}
+
+# ==== version helpers ======================================================
+# Compare dotted versions with an optional prerelease suffix, e.g.
+# "0.1.2-rc.1" < "0.1.2" < "0.1.3-alpha.1". Returns -1, 0 or 1.
+function Compare-DshVersion {
+    param([string]$a, [string]$b)
+    if ($a -eq $b) { return 0 }
+
+    function Parse-DshVersion([string]$v, [ref]$nums, [ref]$pre) {
+        $v = ($v -split '\+')[0]
+        $pre.Value = ''
+        $i = $v.IndexOf('-')
+        if ($i -ge 0) { $pre.Value = $v.Substring($i + 1); $v = $v.Substring(0, $i) }
+        $n = @($v -split '\.')
+        while ($n.Count -lt 3) { $n += '0' }
+        $nums.Value = $n
+    }
+    function Compare-DshIdent([string]$x, [string]$y) {
+        $nx = 0; $ny = 0
+        $ix = [int]::TryParse($x, [ref]$nx)
+        $iy = [int]::TryParse($y, [ref]$ny)
+        if ($ix -and $iy) { return [math]::Sign($nx - $ny) }
+        if ($ix) { return -1 }                          # numeric sorts before text
+        if ($iy) { return 1 }
+        return [math]::Sign([string]::Compare($x, $y, $true))
+    }
+
+    $na = $null; $pa = ''
+    Parse-DshVersion $a ([ref]$na) ([ref]$pa)
+    $nb = $null; $pb = ''
+    Parse-DshVersion $b ([ref]$nb) ([ref]$pb)
+
+    for ($i = 0; $i -lt 3; $i++) {
+        if ([int]$na[$i] -ne [int]$nb[$i]) { return [math]::Sign([int]$na[$i] - [int]$nb[$i]) }
+    }
+    if ($pa -eq '' -and $pb -ne '') { return 1 }        # release beats prerelease
+    if ($pa -ne '' -and $pb -eq '') { return -1 }
+    if ($pa -eq $pb) { return 0 }
+    $ia = @($pa -split '\.'); $ib = @($pb -split '\.')
+    $m = [Math]::Min($ia.Count, $ib.Count)
+    for ($i = 0; $i -lt $m; $i++) {
+        $c = Compare-DshIdent $ia[$i] $ib[$i]
+        if ($c -ne 0) { return $c }
+    }
+    return [math]::Sign($ia.Count - $ib.Count)
+}
+# ==== end version helpers ==================================================
+
+# ==== node resolution ======================================================
+# Node and npm must never depend on the PATH of the running process: PATH is
+# fixed when a process starts, so a Node.js installed a moment ago (by this
+# installer, by winget, or by an update) is invisible to it. Instead we find
+# node.exe on disk - well-known roots first, then this process PATH, then the
+# machine/user PATH from the registry - and drive npm through node itself.
+function Find-NodeExe {
+    $cands = @()
+    foreach ($root in @(
+        (Join-Path $env:ProgramFiles 'nodejs'),
+        (Join-Path ${env:ProgramFiles(x86)} 'nodejs'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\nodejs'))) {
+        if ($root -and (Test-Path $root)) { $cands += (Join-Path $root 'node.exe') }
+    }
+    foreach ($dir in ($env:PATH -split ';')) {
+        if ($dir) { $cands += (Join-Path $dir 'node.exe') }
+    }
+    foreach ($hive in 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment', 'HKCU:\Environment') {
+        try {
+            $p = (Get-ItemProperty -Path $hive -Name Path -ErrorAction Stop).Path
+            foreach ($dir in ($p -split ';')) {
+                if ($dir) { $cands += (Join-Path $dir 'node.exe') }
+            }
+        } catch { }
+    }
+    foreach ($c in $cands) { if (Test-Path $c) { return $c } }
+    $null
+}
+
+function Install-NodeSilently {
+    # Best effort: fetch the LTS build through winget. Returns true when a
+    # winget process was started (call Find-NodeExe afterwards to verify).
+    try {
+        $wg = (Get-Command winget.exe -ErrorAction SilentlyContinue).Source
+        if (-not $wg) {
+            $p = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+            if (Test-Path $p) { $wg = $p }
+        }
+        if (-not $wg) { return $false }
+        $pr = Start-Process $wg -PassThru -WindowStyle Hidden -ArgumentList @(
+            'install', '--id', 'OpenJS.NodeJS.LTS', '-e', '--silent',
+            '--accept-package-agreements', '--accept-source-agreements')
+        try { $null = $pr.Handle } catch { }
+        $pr.WaitForExit()
+        return $true
+    } catch { return $false }
+}
+# ==== end node resolution ==================================================
+
+# Single-instance lock: keep the legacy name for the default data dir so a new
+# build and a still-running old build of the same install block each other;
+# test copies get their own private name instead.
+$defaultDataDir = Join-Path $env:LOCALAPPDATA 'DeepSeekHarness'
+$mutexName = 'DeepSeekHarnessApp'
+if (-not [string]::Equals($DataDir, $defaultDataDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $mutexName = 'DeepSeekHarnessApp_' + ($DataDir -replace '[^A-Za-z0-9]', '_')
+}
 
 $shell = New-Object -ComObject WScript.Shell
 function Say($msg, $icon = 64) { $shell.Popup($msg, 15, 'DeepSeek Harness', $icon) | Out-Null }
@@ -64,14 +247,14 @@ function Show-Log($title, $body) {
 }
 
 # --- settings ---------------------------------------------------------------
+# autoUpdate : install newer builds of your own channel silently (default on).
+#              Turn it off to be asked before every update instead.
 function Get-Settings {
-    $d = @{ channel = $DefaultChannel; skipVersion = '' }
+    $d = @{ autoUpdate = $true }
     if (Test-Path $settingsPath) {
         try {
             $j = Get-Content $settingsPath -Raw | ConvertFrom-Json
-            if ($j.channel)     { $d.channel     = [string]$j.channel }
-            if ($j.skipVersion) { $d.skipVersion = [string]$j.skipVersion }
-            elseif ($j.skipAlpha) { $d.skipVersion = [string]$j.skipAlpha }   # older key
+            if ($null -ne $j.autoUpdate) { $d.autoUpdate = [bool]$j.autoUpdate }
         } catch { }
     }
     $d
@@ -84,10 +267,11 @@ function Save-Settings($s) {
 $splash = New-Object Windows.Forms.Form
 $splash.FormBorderStyle = 'None'
 $splash.StartPosition   = 'CenterScreen'
-$splash.Size            = New-Object Drawing.Size(470, 172)
+$splash.Size            = New-Object Drawing.Size(500, 262)
 $splash.BackColor       = [Drawing.Color]::FromArgb(24, 24, 27)
 $splash.TopMost         = $true
 $splash.Text            = 'DeepSeek Harness'
+$splash.KeyPreview      = $true
 
 function New-Label($text, $x, $y, $w, $size, $argb) {
     $l = New-Object Windows.Forms.Label
@@ -100,17 +284,38 @@ function New-Label($text, $x, $y, $w, $size, $argb) {
     $l
 }
 
-$lblTitle  = New-Label 'DeepSeek Harness' 28 26  400 15 0xFFF4F4F5
-$lblStatus = New-Label 'Starting...'      28 68  400 10 0xFF9CA3AF
-$lblVer    = New-Label ''                 28 132 400  8 0xFF6B7280
+$lblTitle  = New-Label 'DeepSeek Harness' 28 22  440 15 0xFFF4F4F5
+$lblStatus = New-Label 'Starting...'      28 56  440 10 0xFF9CA3AF
+$lblVer    = New-Label ''                 28 80  440  9 0xFF6B7280
+$lblRel    = New-Label ''                 28 116 440  9 0xFFB4B4BB
+$lblAlp    = New-Label ''                 28 138 440  9 0xFFB4B4BB
 
 $bar = New-Object Windows.Forms.ProgressBar
 $bar.Style    = 'Marquee'
-$bar.Location = New-Object Drawing.Point(28, 104)
-$bar.Size     = New-Object Drawing.Size(414, 8)
+$bar.Location = New-Object Drawing.Point(28, 166)
+$bar.Size     = New-Object Drawing.Size(444, 8)
 $bar.MarqueeAnimationSpeed = 25
 
-$splash.Controls.AddRange(@($lblTitle, $lblStatus, $lblVer, $bar))
+$btnAct = New-Object Windows.Forms.Button
+$btnAct.Size      = New-Object Drawing.Size(444, 34)
+$btnAct.Location  = New-Object Drawing.Point(28, 194)
+$btnAct.FlatStyle = 'Flat'
+$btnAct.BackColor = [Drawing.Color]::FromArgb(37, 99, 235)
+$btnAct.ForeColor = [Drawing.Color]::White
+$btnAct.Font      = New-Object Drawing.Font('Segoe UI', 10)
+$btnAct.Visible   = $false
+$btnAct.Text      = ''
+
+# splashChoice: $null = undecided, 'act' = action button used, 'none' = skip
+$script:splashChoice = $null
+$btnAct.Add_Click({ $script:splashChoice = 'act' }.GetNewClosure())
+$splash.Add_KeyDown({
+    if ($_.KeyCode -in @([Windows.Forms.Keys]::Enter, [Windows.Forms.Keys]::Escape)) {
+        if ($null -eq $script:splashChoice) { $script:splashChoice = 'none' }
+    }
+}.GetNewClosure())
+
+$splash.Controls.AddRange(@($lblTitle, $lblStatus, $lblVer, $lblRel, $lblAlp, $bar, $btnAct))
 $splash.Show()
 
 function Status($text) { $lblStatus.Text = $text; [Windows.Forms.Application]::DoEvents() }
@@ -123,8 +328,36 @@ function Pump($ms) {
 }
 function Close-Splash { if ($splash -and -not $splash.IsDisposed) { $splash.Close(); $splash.Dispose() } }
 
+# Show the two channel rows on the splash while versions are checked.
+function Set-SplashRows($relText, $alpText) {
+    if ($lblRel -and -not $lblRel.IsDisposed) { $lblRel.Text = [string]$relText }
+    if ($lblAlp -and -not $lblAlp.IsDisposed) { $lblAlp.Text = [string]$alpText }
+}
+
+# Show (or hide, when $text is empty) the single contextual action button.
+function Set-SplashAction($text) {
+    if ($btnAct -and -not $btnAct.IsDisposed) {
+        $script:splashChoice = $null
+        if ([string]$text -eq '') { $btnAct.Visible = $false }
+        else { $btnAct.Text = [string]$text; $btnAct.Visible = $true }
+    }
+}
+
+# Pump the splash until the user acts, presses Enter/Esc, or the timeout
+# passes. Returns 'act' or 'none'.
+function Wait-SplashDecision($seconds) {
+    $script:splashChoice = $null
+    $end = (Get-Date).AddSeconds([Math]::Max(0, [int]$seconds))
+    while ($null -eq $script:splashChoice -and (Get-Date) -lt $end) {
+        [Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 40
+    }
+    if ($null -eq $script:splashChoice) { $script:splashChoice = 'none' }
+    $script:splashChoice
+}
+
 # --- single instance --------------------------------------------------------
-$mutex = New-Object System.Threading.Mutex($false, 'DeepSeekHarnessApp')
+$mutex = New-Object System.Threading.Mutex($false, $mutexName)
 if (-not $mutex.WaitOne(0)) { Close-Splash; Say 'DeepSeek Harness is already running.'; exit 0 }
 
 # --- versions ---------------------------------------------------------------
@@ -147,405 +380,292 @@ function Get-DistTags {
     if ($doc) { $doc.'dist-tags' } else { $null }
 }
 
-# --- update dialog ----------------------------------------------------------
-# Returns one of: pick | ignore | none
-function Show-ChannelDialog($installed, $channel, $offered, $isAlpha) {
-    $state = @{ choice = 'none'; left = $DialogTimeout }
-
-    $f = New-Object Windows.Forms.Form
-    $f.Text            = 'DeepSeek Harness'
-    $f.FormBorderStyle = 'FixedDialog'
-    $f.StartPosition   = 'CenterScreen'
-    $f.ClientSize      = New-Object Drawing.Size(600, 232)
-    $f.MaximizeBox     = $false
-    $f.MinimizeBox     = $false
-    $f.BackColor       = [Drawing.Color]::FromArgb(32, 32, 36)
-    $f.TopMost         = $true
-
-    $head = if ($isAlpha) { 'Alpha build available' } else { 'Update available' }
-    $f.Controls.Add((New-Label $head 24 20 550 13 0xFFF4F4F5))
-
-    $body  = "Installed:  $installed  ($channel)`r`nAvailable:  $offered"
-    if ($isAlpha) {
-        $body += "`r`n`r`nAlpha builds change often, are not the version DeepSeek marks"
-        $body += "`r`nas ready, and can be replaced or withdrawn."
-    }
-    $txt = New-Label $body 24 56 550 9 0xFFB4B4BB
-    $txt.Size = New-Object Drawing.Size(550, 110)
-    $f.Controls.Add($txt)
-
-    function New-ChoiceButton($text, $x) {
-        $b = New-Object Windows.Forms.Button
-        $b.Text      = $text
-        $b.Size      = New-Object Drawing.Size(150, 30)
-        $b.Location  = New-Object Drawing.Point($x, 180)
-        $b.FlatStyle = 'Flat'
-        $b.BackColor = [Drawing.Color]::FromArgb(55, 55, 62)
-        $b.ForeColor = [Drawing.Color]::White
-        $b.Font      = New-Object Drawing.Font('Segoe UI', 9)
-        $b
-    }
-
-    $bNone   = New-ChoiceButton "Not now ($($state.left))" 434
-    $bIgnore = New-ChoiceButton 'Ignore this version'      276
-    $bPick   = New-ChoiceButton 'Pick version...'          118
-
-    $bNone.Add_Click({   $state.choice = 'none';   $f.Close() }.GetNewClosure())
-    $bIgnore.Add_Click({ $state.choice = 'ignore'; $f.Close() }.GetNewClosure())
-    $bPick.Add_Click({   $state.choice = 'pick';   $f.Close() }.GetNewClosure())
-
-    $f.Controls.AddRange(@($bPick, $bIgnore, $bNone))
-
-    # Default to "Not now" so an unattended launch carries on by itself.
-    $f.AcceptButton = $bNone
-    $f.CancelButton = $bNone
-    $f.Add_Shown({ $bNone.Focus() }.GetNewClosure())
-
-    $timer = $null
-    if ($DialogTimeout -gt 0) {
-        $timer = New-Object Windows.Forms.Timer
-        $timer.Interval = 1000
-        $timer.Add_Tick({
-            $state.left--
-            if ($state.left -le 0) { $timer.Stop(); $f.Close() }
-            else { $bNone.Text = "Not now ($($state.left))" }
-        }.GetNewClosure())
-        $timer.Start()
-    }
-
-    $f.ShowDialog() | Out-Null
-    if ($timer) { $timer.Stop(); $timer.Dispose() }
-    $f.Dispose()
-    $state.choice
+# --- self test --------------------------------------------------------------
+# "DSHLauncher.exe -selftest" (or: powershell -File .\dsh-app.ps1 -selftest)
+# prints how this run is wired up and exits before any window or dialog opens.
+# It never touches the registry, the network or any real install.
+if ($args -contains '-selftest') {
+    Write-Host 'DSH Launcher self test'
+    Write-Host ("  DataDir     : {0}"   -f $DataDir)
+    Write-Host ("  Port        : {0}"   -f $Port)
+    Write-Host ("  Mutex       : {0}"   -f $mutexName)
+    Write-Host ("  runtimeDir  : {0}"   -f $runtimeDir)
+    Write-Host ("  profileDir  : {0}"   -f $profileDir)
+    Write-Host ("  profileRoot : {0}"   -f $profileRoot)
+    Write-Host ("  settingsPath: {0}"   -f $settingsPath)
+    $s = Get-Settings
+    Write-Host ("  defaults    : autoUpdate={0}" -f $s.autoUpdate)
+    Write-Host ("  installed   : {0}" -f (Get-InstalledVersion))
+    Write-Host ("  compare rc/alpha 0.1.2-rc.1 vs 0.1.5-alpha.1 : {0}" -f (Compare-DshVersion '0.1.2-rc.1' '0.1.5-alpha.1'))
+    Write-Host ("  compare rc vs release 0.1.2-rc.1 vs 0.1.2 : {0}" -f (Compare-DshVersion '0.1.2-rc.1' '0.1.2'))
+    $np = Find-NodeExe
+    Write-Host ("  node        : {0}" -f $(if ($np) { $np } else { 'not found' }))
+    if ($np) { Write-Host ("  node version: {0}" -f (& $np --version 2>$null)) }
+    Close-Splash
+    exit 0
 }
 
-# Shown every boot while on alpha. Auto-closes to "stay" after $DialogTimeout
-# seconds. Returns: pick | no
-function Show-AlphaReminder($installed, $stableVer) {
-    $state = @{ choice = 'no'; left = $DialogTimeout }
-
-    $f = New-Object Windows.Forms.Form
-    $f.Text            = 'DeepSeek Harness'
-    $f.FormBorderStyle = 'FixedDialog'
-    $f.StartPosition   = 'CenterScreen'
-    $f.ClientSize      = New-Object Drawing.Size(600, 210)
-    $f.MaximizeBox     = $false
-    $f.MinimizeBox     = $false
-    $f.BackColor       = [Drawing.Color]::FromArgb(32, 32, 36)
-    $f.TopMost         = $true
-
-    $f.Controls.Add((New-Label 'You are on the alpha channel' 24 20 550 13 0xFFF4F4F5))
-
-    $body  = "Installed:    $installed`r`nStable (RC):  $stableVer`r`n`r`n"
-    $body += 'Alpha builds are unstable and change often.'
-    $txt = New-Label $body 24 54 550 9 0xFFB4B4BB
-    $txt.Size = New-Object Drawing.Size(550, 90)
-    $f.Controls.Add($txt)
-
-    function New-DlgButton($text, $x) {
-        $b = New-Object Windows.Forms.Button
-        $b.Text      = $text
-        $b.Size      = New-Object Drawing.Size(150, 30)
-        $b.Location  = New-Object Drawing.Point($x, 160)
-        $b.FlatStyle = 'Flat'
-        $b.BackColor = [Drawing.Color]::FromArgb(55, 55, 62)
-        $b.ForeColor = [Drawing.Color]::White
-        $b.Font      = New-Object Drawing.Font('Segoe UI', 9)
-        $b
-    }
-
-    $bNo   = New-DlgButton "Stay on alpha ($($state.left))" 434
-    $bPick = New-DlgButton 'Pick version...' 276
-
-    $bNo.Add_Click({   $state.choice = 'no';   $f.Close() }.GetNewClosure())
-    $bPick.Add_Click({ $state.choice = 'pick'; $f.Close() }.GetNewClosure())
-
-    $f.Controls.AddRange(@($bPick, $bNo))
-    $f.AcceptButton = $bNo          # Enter keeps you on alpha
-    $f.CancelButton = $bNo          # Esc does the same
-
-    $timer = $null
-    if ($DialogTimeout -gt 0) {
-        $timer = New-Object Windows.Forms.Timer
-        $timer.Interval = 1000
-        $timer.Add_Tick({
-            $state.left--
-            if ($state.left -le 0) { $timer.Stop(); $f.Close() }
-            else { $bNo.Text = "Stay on alpha ($($state.left))" }
-        }.GetNewClosure())
-        $timer.Start()
-    }
-
-    $f.Add_Shown({ $bNo.Focus() }.GetNewClosure())
-    $f.ShowDialog() | Out-Null
-    if ($timer) { $timer.Stop(); $timer.Dispose() }
-    $f.Dispose()
-    $state.choice
+# Yes/No confirmation used before anything that downloads a build, so nobody
+# is surprised by the download/install time. Returns true when confirmed.
+function Confirm-Install([string]$target, [string]$reason) {
+    $body = "About to download and install dsh $target.`r`n"
+    if ($reason) { $body += "$reason`r`n" }
+    $body += "`r`nDownloading and installing can take several minutes, more on a slow" +
+             "`r`nconnection. The app will close and restart by itself when done.`r`n`r`nProceed?"
+    $r = $shell.Popup($body, 0, 'DeepSeek Harness', 4 + 32)
+    ($r -eq 6)
 }
 
-# Shown on first run. Two columns of published versions - stable/rc on the
-# left, alpha on the right. Returns a version string, or $null if cancelled.
-function Show-VersionPicker($tags, $current) {
-    $doc = Get-Packument
-    if (-not $doc) { return $null }
-
-    $all = @($doc.versions.PSObject.Properties.Name)
-    [array]::Reverse($all)                       # registry lists oldest first
-    $stable = @($all | Where-Object { $_ -notmatch '-alpha' })
-    $alpha  = @($all | Where-Object { $_ -match  '-alpha' })
-
+# Shown on the very first run. Only the two current builds are offered - the
+# latest release and the latest alpha - because the launcher keeps whatever is
+# installed on the latest of its channel automatically. There is no reason to
+# pick an older build.
+# Returns 'release' | 'alpha' | $null (closed without choosing).
+function Show-FirstRunChoice($releaseTag, $alphaTag) {
     $state = @{ choice = $null }
 
     $f = New-Object Windows.Forms.Form
     $f.Text            = 'DeepSeek Harness'
     $f.FormBorderStyle = 'FixedDialog'
     $f.StartPosition   = 'CenterScreen'
-    $f.ClientSize      = New-Object Drawing.Size(640, 430)
+    $f.ClientSize      = New-Object Drawing.Size(620, 300)
     $f.MaximizeBox     = $false
     $f.MinimizeBox     = $false
     $f.BackColor       = [Drawing.Color]::FromArgb(32, 32, 36)
     $f.TopMost         = $true
 
-    $f.Controls.Add((New-Label 'Choose a version to install' 24 20 590 14 0xFFF4F4F5))
-    $f.Controls.Add((New-Label 'Stable / release candidate'  24 62 270  9 0xFFB4B4BB))
-    $f.Controls.Add((New-Label 'Alpha - unstable'           336 62 270  9 0xFFB4B4BB))
+    $f.Controls.Add((New-Label 'Welcome - choose a channel' 24 20 560 14 0xFFF4F4F5))
 
-    $mark = '   <- installed'
-
-    function New-VersionList($x, $items) {
-        $lb = New-Object Windows.Forms.ListBox
-        $lb.Location      = New-Object Drawing.Point($x, 88)
-        $lb.Size          = New-Object Drawing.Size(280, 200)
-        $lb.BackColor     = [Drawing.Color]::FromArgb(24, 24, 27)
-        $lb.ForeColor     = [Drawing.Color]::FromArgb(0xFF, 0xF4, 0xF4, 0xF5)
-        $lb.BorderStyle   = 'FixedSingle'
-        $lb.Font          = New-Object Drawing.Font('Consolas', 10)
-        $lb.IntegralHeight = $false
-        foreach ($v in $items) {
-            if ($current -and $v -eq $current) { [void]$lb.Items.Add("$v$mark") }
-            else                               { [void]$lb.Items.Add($v) }
-        }
-        $lb
+    function New-ChannelButton($text, $y, $enabled) {
+        $b = New-Object Windows.Forms.Button
+        $b.Text      = $text
+        $b.Size      = New-Object Drawing.Size(560, 36)
+        $b.Location  = New-Object Drawing.Point(24, $y)
+        $b.FlatStyle = 'Flat'
+        $b.BackColor = if ($enabled) { [Drawing.Color]::FromArgb(55, 55, 62) } else { [Drawing.Color]::FromArgb(35, 35, 40) }
+        $b.ForeColor = if ($enabled) { [Drawing.Color]::White } else { [Drawing.Color]::FromArgb(120, 120, 125) }
+        $b.Font      = New-Object Drawing.Font('Segoe UI', 10)
+        $b.Enabled   = $enabled
+        $b
     }
 
-    $lstStable = New-VersionList 24  $stable
-    $lstAlpha  = New-VersionList 336 $alpha
-    $f.Controls.AddRange(@($lstStable, $lstAlpha))
+    $bRelease = New-ChannelButton ('Install release  (' + $releaseTag + ')') 58 ($null -ne $releaseTag)
+    $bAlpha   = New-ChannelButton ('Install alpha  (' + $alphaTag + ')')   106 ($null -ne $alphaTag)
 
-    # Only one side can hold a selection at a time.
-    $lstStable.Add_SelectedIndexChanged({ if ($lstStable.SelectedIndex -ge 0) { $lstAlpha.ClearSelected() } }.GetNewClosure())
-    $lstAlpha.Add_SelectedIndexChanged({ if ($lstAlpha.SelectedIndex -ge 0) { $lstStable.ClearSelected() } }.GetNewClosure())
+    $bRelease.Add_Click({ $state.choice = 'release'; $f.Close() }.GetNewClosure())
+    $bAlpha.Add_Click({   $state.choice = 'alpha';   $f.Close() }.GetNewClosure())
 
-    # Preselect the installed version, else whatever the registry calls "latest".
-    if ($current) {
-        $i = $lstStable.Items.IndexOf("$current$mark")
-        if ($i -ge 0) { $lstStable.SelectedIndex = $i }
-        else {
-            $i = $lstAlpha.Items.IndexOf("$current$mark")
-            if ($i -ge 0) { $lstAlpha.SelectedIndex = $i }
-        }
-    }
-    if ($lstStable.SelectedIndex -lt 0 -and $lstAlpha.SelectedIndex -lt 0 -and $tags -and $tags.latest) {
-        $i = $lstStable.Items.IndexOf([string]$tags.latest)
-        if ($i -ge 0) { $lstStable.SelectedIndex = $i }
-    }
-    if ($lstStable.SelectedIndex -lt 0 -and $lstStable.Items.Count) { $lstStable.SelectedIndex = 0 }
+    $f.Controls.AddRange(@($bRelease, $bAlpha))
 
-    $note = New-Label ("Alpha builds change often, are not the version DeepSeek marks as ready,`r`n" +
-                       "and can be replaced or withdrawn. Pick the stable column unless you`r`n" +
-                       "specifically need something in alpha.") 24 298 590 9 0xFF9CA3AF
-    $note.Size = New-Object Drawing.Size(590, 60)
+    $note = New-Label ("Alpha builds change often and may be unstable.`r`n" +
+                       "Installing downloads now and takes a few minutes. Newer builds of`r`n" +
+                       "your channel install automatically afterwards, and you can switch`r`n" +
+                       "channels any time from the status card on each start.") 24 160 560 9 0xFF9CA3AF
+    $note.Size = New-Object Drawing.Size(560, 90)
     $f.Controls.Add($note)
 
-    $btnInstall = New-Object Windows.Forms.Button
-    $btnInstall.Text      = 'Install'
-    $btnInstall.Size      = New-Object Drawing.Size(130, 30)
-    $btnInstall.Location  = New-Object Drawing.Point(474, 378)
-    $btnInstall.FlatStyle = 'Flat'
-    $btnInstall.BackColor = [Drawing.Color]::FromArgb(55, 55, 62)
-    $btnInstall.ForeColor = [Drawing.Color]::White
-    $btnInstall.Font      = New-Object Drawing.Font('Segoe UI', 9)
-
-    $btnCancel = New-Object Windows.Forms.Button
-    $btnCancel.Text      = 'Cancel'
-    $btnCancel.Size      = New-Object Drawing.Size(130, 30)
-    $btnCancel.Location  = New-Object Drawing.Point(336, 378)
-    $btnCancel.FlatStyle = 'Flat'
-    $btnCancel.BackColor = [Drawing.Color]::FromArgb(55, 55, 62)
-    $btnCancel.ForeColor = [Drawing.Color]::White
-    $btnCancel.Font      = New-Object Drawing.Font('Segoe UI', 9)
-
-    $btnInstall.Add_Click({
-        $pick = $null
-        if ($lstStable.SelectedItem)     { $pick = [string]$lstStable.SelectedItem }
-        elseif ($lstAlpha.SelectedItem)  { $pick = [string]$lstAlpha.SelectedItem }
-        if ($pick) { $state.choice = ($pick -replace '\s+<- installed$', '') }
-        $f.Close()
-    }.GetNewClosure())
-    $btnCancel.Add_Click({ $state.choice = $null; $f.Close() }.GetNewClosure())
-
-    $f.Controls.AddRange(@($btnCancel, $btnInstall))
-    $f.AcceptButton = $btnInstall
-    $f.CancelButton = $btnCancel
-
+    $f.AcceptButton = $bRelease
     $f.ShowDialog() | Out-Null
     $f.Dispose()
     $state.choice
-}
-
-# Opens the version table and applies the choice. Picking the version that is
-# already installed reinstalls it, which doubles as a repair.
-function Invoke-VersionPicker {
-    $splash.TopMost = $false
-    $picked = Show-VersionPicker $tags $installed
-    $splash.TopMost = $true
-    if (-not $picked) { return }
-
-    $script:install     = $picked
-    $script:settings.channel   = if ($picked -match '-alpha') { 'alpha' } else { 'latest' }
-    $script:settings.skipVersion = ''
-    Save-Settings $script:settings
-    $script:channel = $script:settings.channel
 }
 
 # --- decide what to install -------------------------------------------------
 Status 'Checking for updates...'
 
 $settings  = Get-Settings
-$channel   = $settings.channel
 $installed = Get-InstalledVersion
-if ($installed) { $lblVer.Text = "dsh $installed  ($channel)" }
+if ($installed) { $lblVer.Text = "dsh $installed" }
 
-$tags      = Get-DistTags
-$tagVer    = if ($tags) { $tags.$channel } else { $null }
-$alphaVer  = if ($tags) { $tags.alpha }    else { $null }
-$stableVer = if ($tags) { $tags.latest }   else { $null }
+$tags       = Get-DistTags
+$tagRelease = if ($tags) { $tags.latest } else { $null }
+$tagAlpha   = if ($tags) { $tags.alpha }  else { $null }
 
 $install = $null
 
-# On the alpha channel, offer a way back every boot. Auto-dismisses to "No"
-# after 3 seconds, so an unattended launch just carries on.
-if ($installed -and $channel -eq 'alpha' -and $stableVer) {
-    $splash.TopMost = $false
-    $back = Show-AlphaReminder $installed $stableVer
-    $splash.TopMost = $true
-
-    if ($back -eq 'pick') { Invoke-VersionPicker }
-}
-
-$firstRun = -not $installed
-
-if ($firstRun) {
-    Status 'Fetching available versions...'
-    $splash.TopMost = $false
-    $install = Show-VersionPicker $tags $null
-    $splash.TopMost = $true
-
-    if (-not $install) { Close-Splash; Stop-Harness; exit 0 }     # user cancelled
-
-    $settings.channel = if ($install -match '-alpha') { 'alpha' } else { 'latest' }
-    Save-Settings $settings
-    $channel = $settings.channel
-}
-elseif (-not $install) {
-    # One offer at a time: a newer build on the current channel, or - when on
-    # the stable channel - an alpha the user has not already ignored.
-    $offered = $null
-    $isAlpha = $false
-
-    if ($tagVer -and $tagVer -ne $installed) {
-        $offered = $tagVer
-        $isAlpha = ($channel -eq 'alpha')
-    }
-    elseif ($channel -eq 'latest' -and $alphaVer -and $alphaVer -ne $installed) {
-        $offered = $alphaVer
-        $isAlpha = $true
+if (-not $installed) {
+    # --- first run --------------------------------------------------------
+    if (-not $tagRelease -and -not $tagAlpha) {
+        Close-Splash
+        Say "Could not reach the package registry.`nCheck your internet connection and relaunch." 48
+        Stop-Harness
+        exit 0
     }
 
-    if ($offered -and $offered -ne $settings.skipVersion) {
-        Status 'Update available.'
-        $splash.TopMost = $false
-        $answer = Show-ChannelDialog $installed $channel $offered $isAlpha
-        $splash.TopMost = $true
+    Status 'Checking available builds...'
+    $splash.TopMost = $false
+    $choice = Show-FirstRunChoice $tagRelease $tagAlpha
+    $splash.TopMost = $true
 
-        switch ($answer) {
-            'pick'   { Invoke-VersionPicker }
-            'ignore' { $settings.skipVersion = $offered; Save-Settings $settings }
+    if (-not $choice) { Close-Splash; Stop-Harness; exit 0 }   # closed without choosing
+
+    $install = if ($choice -eq 'alpha') { $tagAlpha } else { $tagRelease }
+}
+else {
+    # Which channel the installed build belongs to decides everything else:
+    # same-line builds update silently; the other line is one click away.
+    $myLine    = if ($installed -match '-alpha') { 'alpha' } else { 'release' }
+    $otherLine = if ($myLine -eq 'alpha') { 'release' } else { 'alpha' }
+    $myTag     = if ($myLine -eq 'alpha') { $tagAlpha }   else { $tagRelease }
+    $otherTag  = if ($myLine -eq 'alpha') { $tagRelease } else { $tagAlpha }
+
+    $cmpSame = if ($myTag) { Compare-DshVersion $myTag $installed } else { 0 }
+    $sameUpdate = ($cmpSame -gt 0)
+
+    if ($sameUpdate -and $settings.autoUpdate) {
+        # Silent, unattended same-line update (release and alpha alike).
+        # The splash announces it; no dialog interrupts the start.
+        $install = $myTag
+        Status "New $myLine build $myTag found - updating automatically..."
+    }
+    else {
+        # One window does it all: while the splash says "Checking for updates"
+        # it also shows both channels and the single switch button. No second
+        # dialog pops up over it; ignoring the button (or Enter/Esc) carries on.
+        $rowR = ''
+        $rowA = ''
+        if ($myLine -eq 'release') {
+            $rowR = "installed  $installed"
+            if ($sameUpdate) { $rowR = "installed  $installed   (newer $myTag)" }
+            $rowA = if ($otherTag) { "latest  $otherTag" } else { 'not published' }
         }
+        else {
+            $rowR = if ($otherTag) { "latest  $otherTag" } else { 'not published' }
+            $rowA = "installed  $installed"
+            if ($sameUpdate) { $rowA = "installed  $installed   (newer $myTag)" }
+        }
+        Set-SplashRows "Release channel   $rowR" "Alpha channel      $rowA"
+
+        if ($sameUpdate) {
+            Status 'Update available...'
+            Set-SplashAction "Update now to $myTag"
+        }
+        elseif ($otherTag) {
+            Set-SplashAction $(if ($myLine -eq 'release') { "Try alpha ($otherTag)" } else { "Go stable ($otherTag)" })
+        }
+
+        # Wait only when there is a button to press.
+        if ($btnAct.Visible) {
+            $decision = Wait-SplashDecision $DialogTimeout
+            Set-SplashAction ''          # hide the button again
+            if ($decision -eq 'act') {
+                if ($sameUpdate) {
+                    if (Confirm-Install $myTag "Update on the $myLine channel.") { $install = $myTag }
+                }
+                elseif ($otherTag) {
+                    $reason = "This switches you from the $myLine channel to the $otherLine channel."
+                    if ($otherLine -eq 'alpha') {
+                        $reason += ' Alpha builds change often and may be unstable.'
+                    }
+                    if (Confirm-Install $otherTag $reason) { $install = $otherTag }
+                }
+            }
+        }
+        Set-SplashRows '' ''
     }
 }
 
-function Stop-OrphanHarness {
-    Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like "*DeepSeekHarness*" } |
-        ForEach-Object { taskkill /PID $_.ProcessId /T /F 2>$null | Out-Null }
+# --- node resolution --------------------------------------------------------
+# Everything below (npm install and booting the harness) runs node directly by
+# path, so it works even when Node was installed after this process started
+# and the PATH of this process was never refreshed.
+$nodePath = Find-NodeExe
+if (-not $nodePath) {
+    Status 'Node.js is missing - installing the LTS build...'
+    Install-NodeSilently | Out-Null
+    $nodePath = Find-NodeExe
+}
+if (-not $nodePath) {
+    Close-Splash
+    Say ("Node.js was not found and could not be installed automatically.`n`n" +
+         'Install the LTS build from nodejs.org, then relaunch DSH Launcher.') 16
+    Stop-Harness
+    exit 1
 }
 
-function Test-PortFree($p) {
-    try {
-        $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $p)
-        $l.Start(); $l.Stop(); $true
-    } catch { $false }
+$nodeMajor = 0
+try {
+    $nv = & $nodePath --version 2>$null
+    if ($nv -match '^v?(\d+)') { $nodeMajor = [int]$Matches[1] }
+} catch { }
+if ($nodeMajor -gt 0 -and $nodeMajor -lt 18) {
+    Close-Splash
+    Say ("Node.js $nodeMajor was found, but the DeepSeek Harness needs Node 18 or newer.`n`n" +
+         'Install the current LTS build from nodejs.org, then relaunch.') 16
+    Stop-Harness
+    exit 1
 }
-
-function Get-ProfilePluginCount {
-    @(Get-ChildItem (Join-Path $webProfile 'node_modules\@deepseek-ai') -ErrorAction SilentlyContinue).Count
-}
-
+$npmCli = Join-Path (Split-Path $nodePath) 'node_modules\npm\bin\npm-cli.js'
+if (-not (Test-Path $npmCli)) { $npmCli = $null }   # unusual; fall back below
 
 # --- install / update -------------------------------------------------------
 if ($install) {
     Status "Installing dsh $install - this takes a minute..."
 
-    # Release file locks left by a previous session before deleting anything.
-    # Native .node / .dll files stay locked while any harness is alive, which is
-    # what turns a half-deleted node_modules into an install failure.
-    Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like "*DeepSeekHarness*" } |
-        ForEach-Object { taskkill /PID $_.ProcessId /T /F 2>$null | Out-Null }
+    # Install into a staging folder and swap it in only once it verifies, so
+    # the running version stays on disk until the new one is ready. A failed
+    # or interrupted update can therefore never leave the app without a
+    # working runtime.
+    $stageDir      = $runtimeDir + '.new'
+    $swapBackup    = $runtimeDir + '.old'
+    $stageManifest = Join-Path $stageDir 'node_modules\@deepseek-ai\dsh\package.json'
 
-    $nm = Join-Path $runtimeDir 'node_modules'
-    for ($try = 0; $try -lt 4 -and (Test-Path $nm); $try++) {
-        Remove-Item $nm -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path $nm) { Pump 700 }
-    }
-    Remove-Item (Join-Path $runtimeDir 'package-lock.json') -Force -ErrorAction SilentlyContinue
-
-    if (Test-Path $nm) {
-        Close-Splash
-        Say ("Could not clear the old runtime - files are still locked:`n$nm`n`n" +
-             'Close the app, sign out and back in, then relaunch.') 16
-        Stop-Harness
-        exit 1
+    # Clear leftovers from a previous interrupted update.
+    foreach ($d in @($stageDir, $swapBackup)) {
+        for ($try = 0; $try -lt 3 -and (Test-Path $d); $try++) {
+            Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path $d) { Pump 700 }
+        }
     }
 
-    if (-not (Test-Path (Join-Path $runtimeDir 'package.json'))) {
-        '{ "name": "dsh-app-runtime", "private": true }' |
-            Set-Content (Join-Path $runtimeDir 'package.json') -Encoding utf8
-    }
+    New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+    '{ "name": "dsh-app-runtime", "private": true }' |
+        Set-Content (Join-Path $stageDir 'package.json') -Encoding utf8
 
-    $npm = Start-Process cmd.exe -PassThru -WindowStyle Hidden `
-        -ArgumentList '/c', "npm install $Package@$install --prefix `"$runtimeDir`" --no-audit --no-fund" `
-        -RedirectStandardOutput (Join-Path $appDir 'npm.out.log') `
-        -RedirectStandardError  (Join-Path $appDir 'npm.err.log')
+    if ($npmCli) {
+        # Drive npm through node itself; no dependence on PATH or cmd.exe.
+        $npm = Start-Process -FilePath $nodePath -PassThru -WindowStyle Hidden `
+            -ArgumentList @("`"$npmCli`"", 'install', "$Package@$install", '--prefix', "`"$stageDir`"", '--no-audit', '--no-fund') `
+            -RedirectStandardOutput (Join-Path $appDir 'npm.out.log') `
+            -RedirectStandardError  (Join-Path $appDir 'npm.err.log')
+    } else {
+        # Fallback for an unusual install layout: PATH-based npm.
+        $npm = Start-Process cmd.exe -PassThru -WindowStyle Hidden `
+            -ArgumentList '/c', "npm install $Package@$install --prefix `"$stageDir`" --no-audit --no-fund" `
+            -RedirectStandardOutput (Join-Path $appDir 'npm.out.log') `
+            -RedirectStandardError  (Join-Path $appDir 'npm.err.log')
+    }
 
     # Touching .Handle keeps the process handle open, which is what makes
     # ExitCode readable later. Without it, ExitCode is always $null.
     try { $null = $npm.Handle } catch { }
 
-    while (-not $npm.HasExited) { Pump 250 }
+    $installStart = Get-Date
+    $lastNote = -15
+    while (-not $npm.HasExited) {
+        Pump 250
+        $el = [int]((Get-Date) - $installStart).TotalSeconds
+        if ($el -ge $lastNote + 15) {
+            $lastNote = $el
+            Status ("Installing dsh $install - {0}m {1}s so far (first install can take several minutes)..." -f [int]($el / 60), ($el % 60))
+        }
+    }
 
     $exitCode = 'unavailable'
     try { if ($npm.ExitCode -ne $null) { $exitCode = [string]$npm.ExitCode } } catch { }
 
     # The manifest on disk is the real test of success; the exit code is only
     # reported for diagnosis.
-    $nowVersion = Get-InstalledVersion
+    $nowVersion = $null
+    if (Test-Path $stageManifest) {
+        try { $nowVersion = (Get-Content $stageManifest -Raw | ConvertFrom-Json).version } catch { }
+    }
     $ok = [bool]$nowVersion
     if ($ok -and $install -match '^\d') { $ok = ($nowVersion -eq $install) }
 
     if (-not $ok) {
-        Close-Splash
+        # A failed install must never destroy the version that still works.
+        Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
 
         $ne = if (Test-Path (Join-Path $appDir 'npm.err.log')) { Get-Content (Join-Path $appDir 'npm.err.log') -Raw } else { '' }
         $no = if (Test-Path (Join-Path $appDir 'npm.out.log')) { Get-Content (Join-Path $appDir 'npm.out.log') -Raw } else { '' }
@@ -554,25 +674,35 @@ if ($install) {
         $real = ($ne -split "`r?`n" | Where-Object { $_ -match 'npm (error|ERR!)' }) -join "`r`n"
         if (-not $real) { $real = '(no npm error lines found - see full output below)' }
 
-        $report = @"
-Install of $Package@$install failed.
-
-Exit code : $exitCode
-Target    : $runtimeDir
-Installed : $nowVersion
-
-Lines beginning "npm warn deprecated" are harmless notices, not the failure.
-The errors below are the real cause.
+        $stillHave = (Test-Path $manifest) -and [bool](Get-InstalledVersion)
+        $advice = ''
+        if ($stillHave) {
+            $advice = "`nThe previous install was left untouched and will be used."
+        } else {
+            $advice = @"
 
 If this mentions EPERM, EBUSY or a locked .node / .dll file, a previous harness
 is still running. Close the app, then run:
 
   Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
-    Where-Object { `$_.CommandLine -like '*DeepSeekHarness*' } |
+    Where-Object { `$_.CommandLine -like '*$runtimeDir*' } |
     ForEach-Object { Stop-Process -Id `$_.ProcessId -Force }
   Remove-Item "$runtimeDir" -Recurse -Force
 
 Then relaunch.
+"@
+        }
+
+        $report = @"
+Install of $Package@$install failed.
+
+Exit code : $exitCode
+Staging   : $stageDir
+Installed : $nowVersion
+
+Lines beginning "npm warn deprecated" are harmless notices, not the failure.
+The errors below are the real cause.
+$advice
 
 --------------------------- npm errors ---------------------------
 $real
@@ -583,68 +713,64 @@ $no
 "@
 
         Show-Log 'DeepSeek Harness - install failed' $report
-        Stop-Harness
-        exit 1
+
+        if ($stillHave) {
+            # Keep going with the version that was already installed.
+            $installed = Get-InstalledVersion
+            $install = $null
+            Status "Using previously installed dsh $installed."
+        } else {
+            Stop-Harness
+            exit 1
+        }
     }
-    $installed = Get-InstalledVersion
+    else {
+        # Swap the verified staging folder into place. Native .node / .dll
+        # files stay locked while a harness is alive, so release our own
+        # leftovers first or the rename fails.
+        Stop-OrphanHarness
+        for ($try = 0; $try -lt 4 -and (Test-Path $runtimeDir); $try++) {
+            try {
+                Rename-Item $runtimeDir $swapBackup -ErrorAction Stop
+                break
+            } catch { Pump 700 }
+        }
+        if (Test-Path $runtimeDir) {
+            Close-Splash
+            Say ("Could not move the old runtime aside - files are still locked:`n$runtimeDir`n`n" +
+                 'Close the app, sign out and back in, then relaunch.') 16
+            Stop-Harness
+            exit 1
+        }
+
+        try {
+            Rename-Item $stageDir $runtimeDir -ErrorAction Stop
+        } catch {
+            # Put the previous version back so we are never left without one.
+            if (Test-Path $swapBackup) { Rename-Item $swapBackup $runtimeDir -ErrorAction SilentlyContinue }
+            Close-Splash
+            Say ("The new build could not be moved into place:`n$runtimeDir`n`nThe previous version has been restored.") 16
+            Stop-Harness
+            exit 1
+        }
+
+        for ($try = 0; $try -lt 3 -and (Test-Path $swapBackup); $try++) {
+            Remove-Item $swapBackup -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path $swapBackup) { Pump 700 }
+        }
+
+        $installed = Get-InstalledVersion
+    }
 }
-$lblVer.Text = "dsh $installed  ($channel)"
+$lblVer.Text = "dsh $installed"
 
 # --- restart after an install -----------------------------------------------
 # dsh finishes building its plugin tree during the first served session, and
-# that reload drops the open page ("connecting... disconnected"). Killing the
-# process early does not help - the work simply resumes on the next boot. What
-# does work is letting the first session run to completion, then starting over.
-function Restart-Launcher {
-    $exe = ''
-    try { $exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { }
-
-    if ($exe -match '(powershell|pwsh)(_ise)?\.exe$') {
-        if ($PSCommandPath) {
-            Start-Process powershell.exe -ArgumentList `
-                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', `
-                '-File', "`"$PSCommandPath`""
-        }
-    }
-    elseif ($exe) { Start-Process $exe }
-}
-
-function Show-RestartDialog($version) {
-    $f = New-Object Windows.Forms.Form
-    $f.Text            = 'DeepSeek Harness'
-    $f.FormBorderStyle = 'FixedDialog'
-    $f.StartPosition   = 'CenterScreen'
-    $f.ClientSize      = New-Object Drawing.Size(560, 210)
-    $f.MaximizeBox     = $false
-    $f.MinimizeBox     = $false
-    $f.ControlBox      = $false        # the restart is not optional
-    $f.BackColor       = [Drawing.Color]::FromArgb(32, 32, 36)
-    $f.TopMost         = $true
-
-    $f.Controls.Add((New-Label "dsh $version installed" 24 20 500 13 0xFFF4F4F5))
-
-    $body  = "dsh finishes setting itself up during this first session, so the"
-    $body += "`r`nwindow may show 'disconnected' until the app is restarted."
-    $txt = New-Label $body 24 56 500 9 0xFFB4B4BB
-    $txt.Size = New-Object Drawing.Size(500, 80)
-    $f.Controls.Add($txt)
-
-    $b = New-Object Windows.Forms.Button
-    $b.Text      = 'Restart now'
-    $b.Size      = New-Object Drawing.Size(150, 32)
-    $b.Location  = New-Object Drawing.Point(386, 158)
-    $b.FlatStyle = 'Flat'
-    $b.BackColor = [Drawing.Color]::FromArgb(55, 55, 62)
-    $b.ForeColor = [Drawing.Color]::White
-    $b.Font      = New-Object Drawing.Font('Segoe UI', 9)
-    $b.Add_Click({ $f.Close() }.GetNewClosure())
-
-    $f.Controls.Add($b)
-    $f.AcceptButton = $b
-    $f.Add_Shown({ $b.Focus() }.GetNewClosure())
-    $f.ShowDialog() | Out-Null
-    $f.Dispose()
-}
+# that reload drops the open page ("connecting... disconnected"). The reliable
+# remedy is to let that first session run and then start the app once more,
+# so after an install the app asks the user to close it and launch again
+# (Invoke-CloseAfterInstall below) instead of killing the first session and
+# relaunching automatically.
 
 $restartAfterOpen = $PromptRestartAfterInstall -and [bool]$install
 
@@ -661,8 +787,31 @@ if (-not (Test-Path $dshBin)) {
 }
 
 # A harness orphaned by a previous session keeps holding the port, which makes
-# every later launch fail with EADDRINUSE. Clear ours out before binding.
+# every later launch fail with EADDRINUSE. Clear ours out before binding, then
+# give Windows a moment to release the socket.
 Stop-OrphanHarness
+
+# If the pinned port is still taken afterwards, it belongs to something we do
+# not own: refuse rather than drift to a random port, because a second server
+# would fight over the same dsh profile and the Edge app identity.
+$usePort = $Port
+for ($i = 0; $i -lt 12 -and -not (Test-PortFree $usePort); $i++) { Pump 250 }
+if (-not (Test-PortFree $usePort)) {
+    Close-Splash
+    $owner = 'another program'
+    try {
+        $conn = Get-NetTCPConnection -LocalPort $usePort -State Listen -ErrorAction Stop |
+                Select-Object -First 1
+        $pn = (Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue).ProcessName
+        if ($pn) { $owner = "$pn (PID $($conn.OwningProcess))" }
+    } catch { }
+    Say ("Port $usePort is already in use by $owner.`n`n" +
+         'If that is a leftover DeepSeek Harness from an earlier session, just' +
+         "`nrelaunch - leftovers are cleaned up automatically.`n`n" +
+         'Otherwise close the program using the port and relaunch.') 48
+    Stop-Harness
+    exit 1
+}
 
 # dsh owns its plugin profile and installs it with its own pnpm configuration.
 # Do not run pnpm in that folder from here - a plain install produces a tree
@@ -686,14 +835,8 @@ for ($attempt = 1; $attempt -le $maxAttempts -and -not $url; $attempt++) {
 
     Remove-Item $outLog, $errLog -ErrorAction SilentlyContinue
 
-    # Give Windows a moment to release the socket, then fall back to an
-    # OS-assigned port if something outside our control still owns the pinned one.
-    $usePort = $Port
-    for ($i = 0; $i -lt 12 -and -not (Test-PortFree $Port); $i++) { Pump 250 }
-    if (-not (Test-PortFree $Port)) { $usePort = 0 }   # 0 = let the OS pick
-
     # --no-open stops dsh opening the default browser; we supply the window.
-    $harness = Start-Process -FilePath 'node.exe' -PassThru -WindowStyle Hidden `
+    $harness = Start-Process -FilePath $nodePath -PassThru -WindowStyle Hidden `
         -WorkingDirectory $env:USERPROFILE `
         -ArgumentList "`"$dshBin`"", 'web', '--host', '127.0.0.1', '--port', $usePort, '--no-open' `
         -RedirectStandardOutput $outLog -RedirectStandardError $errLog
@@ -701,9 +844,16 @@ for ($attempt = 1; $attempt -le $maxAttempts -and -not $url; $attempt++) {
     try { $null = $harness.Handle } catch { }
 
     # dsh prints its URL once the plugin tree has settled.
+    $bootStart = (Get-Date)
+    $lastNote = -15
     $deadline = (Get-Date).AddSeconds($bootSeconds)
     while (-not $url -and (Get-Date) -lt $deadline) {
         Pump 400
+        $el = [int]((Get-Date) - $bootStart).TotalSeconds
+        if ($el -ge $lastNote + 15) {
+            $lastNote = $el
+            Status ("Waiting for the harness to come up - {0}m {1}s..." -f [int]($el / 60), ($el % 60))
+        }
         $text = ''
         foreach ($f in @($outLog, $errLog)) {
             if (Test-Path $f) { $text += (Get-Content $f -Raw -ErrorAction SilentlyContinue) }
@@ -714,54 +864,80 @@ for ($attempt = 1; $attempt -le $maxAttempts -and -not $url; $attempt++) {
     }
 
     if (-not $url -and $harness -and -not $harness.HasExited) {
-        taskkill /PID $harness.Id /T /F 2>$null | Out-Null
+        Invoke-KillTree $harness.Id
     }
-}
-
-function Stop-Harness {
-    if ($harness -and -not $harness.HasExited) {
-        taskkill /PID $harness.Id /T /F 2>$null | Out-Null
-    }
-    Stop-OrphanHarness   # catch any child that outlived its parent
 }
 
 # Runs even if the console is closed or the script is interrupted, so a harness
-# is never left holding the port.
-# (Replaced with try/finally below; this is kept as fallback but should not be needed)
+# is never left holding the port. Stop-Harness and Stop-OrphanHarness are
+# defined at the top of this file.
 Register-EngineEvent PowerShell.Exiting -Action { Stop-Harness } | Out-Null
 
-# Called once the window is up, only on a launch that installed something.
-function Invoke-PostInstallRestart($browserProc) {
-    Show-RestartDialog $installed
+# Shown once after a successful install. The first session settles the harness
+# profile; closing the app and starting it once more connects cleanly.
+function Show-RestartRequired {
+    $f = New-Object Windows.Forms.Form
+    $f.Text            = 'DeepSeek Harness'
+    $f.FormBorderStyle = 'FixedDialog'
+    $f.StartPosition   = 'CenterScreen'
+    $f.ClientSize      = New-Object Drawing.Size(560, 200)
+    $f.MaximizeBox     = $false
+    $f.MinimizeBox     = $false
+    $f.ControlBox      = $false
+    $f.BackColor       = [Drawing.Color]::FromArgb(32, 32, 36)
+    $f.TopMost         = $true
 
-    # Our exit handler kills every harness matching this app, which would take
-    # out the harness the replacement process is about to start. Drop it, and
-    # stop only the process we own.
+    $f.Controls.Add((New-Label 'Restart required' 24 20 500 13 0xFFF4F4F5))
+
+    $body  = "dsh $installed was installed.`r`n"
+    $body += "`r`nThe first session finishes the setup. Close the app now and start"
+    $body += "`r`nit again from the Start Menu - the second start connects cleanly."
+    $txt = New-Label $body 24 56 500 9 0xFFB4B4BB
+    $txt.Size = New-Object Drawing.Size(500, 90)
+    $f.Controls.Add($txt)
+
+    $b = New-Object Windows.Forms.Button
+    $b.Text      = 'Close'
+    $b.Size      = New-Object Drawing.Size(150, 32)
+    $b.Location  = New-Object Drawing.Point(386, 150)
+    $b.FlatStyle = 'Flat'
+    $b.BackColor = [Drawing.Color]::FromArgb(55, 55, 62)
+    $b.ForeColor = [Drawing.Color]::White
+    $b.Font      = New-Object Drawing.Font('Segoe UI', 9)
+    $b.Add_Click({ $f.Close() }.GetNewClosure())
+
+    $f.Controls.Add($b)
+    $f.AcceptButton = $b
+    $f.Add_Shown({ $b.Focus() }.GetNewClosure())
+    $f.ShowDialog() | Out-Null
+    $f.Dispose()
+}
+
+# Called once the window is up, on a launch that just installed something.
+# The user closes the app here and starts it again themselves.
+function Invoke-CloseAfterInstall($windowProc) {
+    Show-RestartRequired
+
+    # The user has committed to closing, so free the single-instance lock NOW.
+    # Cleanup below takes a second or two; releasing first means a quick
+    # relaunch never hits a phantom "already running" message.
     Get-EventSubscriber -ErrorAction SilentlyContinue |
         Where-Object { $_.SourceIdentifier -eq 'PowerShell.Exiting' } |
         Unregister-Event -ErrorAction SilentlyContinue
+    try { $mutex.ReleaseMutex(); $mutex.Dispose() } catch { }
 
-    if ($browserProc -and -not $browserProc.HasExited) {
-        taskkill /PID $browserProc.Id /T /F 2>$null | Out-Null
+    # Stop everything from this run; the next launch starts fresh.
+    if ($windowProc -and -not $windowProc.HasExited) {
+        Invoke-KillTree $windowProc.Id
     }
-
-    # Edge can hand the window to a sibling process, so close anything running
-    # against our dedicated profile rather than trusting the PID we started.
     Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and $_.CommandLine -like "*$profileDir*" } |
-        ForEach-Object { taskkill /PID $_.ProcessId /T /F 2>$null | Out-Null }
-    Pump 800
-
-    if ($harness -and -not $harness.HasExited) {
-        taskkill /PID $harness.Id /T /F 2>$null | Out-Null
-    }
-    try { $mutex.ReleaseMutex(); $mutex.Dispose() } catch { }
-    Restart-Launcher
+        ForEach-Object { Invoke-KillTree $_.ProcessId }
+    Stop-Harness
     exit 0
 }
 
 # Called once the window is up, only on a launch that installed something.
-
 if (-not $url) {
     Close-Splash
 
@@ -790,7 +966,7 @@ usually completes on a second run.
     $report = @"
 The harness did not report a URL.
 
-Version : $installed  ($channel)
+Version : $installed
 Entry   : $dshBin
 Command : node "$dshBin" web --host 127.0.0.1 --port $usePort --no-open
 Exit    : $code
@@ -798,8 +974,8 @@ Profile : $webProfile  ($pkgCount plugins)
 $hint
 
 To reproduce in a visible console, paste the Command line above into PowerShell.
-If this started after switching channels, edit settings.json in this folder and
-set "channel" back to "latest", then relaunch and accept the update.
+If this started right after installing a build, close the app and launch it
+once more - the profile usually settles on the second start.
 
 ------------------------------ stderr ------------------------------
 $se
@@ -848,7 +1024,7 @@ switch ($Mode) {
         Start-Process $target.TargetPath -ArgumentList $target.Arguments
 
         Pump 3000; Close-Splash
-        if ($restartAfterOpen) { Invoke-PostInstallRestart $null }
+        if ($restartAfterOpen) { Invoke-CloseAfterInstall $null }
         Start-Sleep -Seconds 2
         $gone = 0
         while ($gone -lt 3) {
@@ -867,7 +1043,7 @@ switch ($Mode) {
 
         if (-not $edge) {
             Start-Process $url; Pump 2500; Close-Splash
-            if ($restartAfterOpen) { Invoke-PostInstallRestart $null }
+            if ($restartAfterOpen) { Invoke-CloseAfterInstall $null }
             $harness.WaitForExit()
         }
         else {
@@ -885,14 +1061,14 @@ switch ($Mode) {
             )
             Pump 2500
             Close-Splash
-            if ($restartAfterOpen) { Invoke-PostInstallRestart $e }
+            if ($restartAfterOpen) { Invoke-CloseAfterInstall $e }
             $e.WaitForExit()
         }
     }
 
     default {
         Start-Process $url; Pump 2500; Close-Splash
-        if ($restartAfterOpen) { Invoke-PostInstallRestart $null }
+        if ($restartAfterOpen) { Invoke-CloseAfterInstall $null }
         $harness.WaitForExit()
     }
 }

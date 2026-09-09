@@ -29,7 +29,7 @@ Invoke-PS2EXE -InputFile  .\dsh-app.ps1 `
               -title   'DSH Launcher' `
               -product 'DSH Launcher' `
               -company 'Mohamed' `
-              -version '1.0.0.0'
+              -version '0.1.1.0'
 
 # --- 2. exe -> installer ---------------------------------------------------
 Write-Host 'Building installer...' -ForegroundColor Cyan
