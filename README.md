@@ -7,7 +7,7 @@
 
 ## What is this?
 
-The [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) is a powerful command‑line tool for interacting with DeepSeek models. However, running it typically requires opening a terminal, remembering npm commands, and using a browser tab. This launcher simplifies everything:
+The [DeepSeek Harness](https://deepseek.com/harness/en/) is a powerful command‑line tool for interacting with DeepSeek models. However, running it typically requires opening a terminal, remembering npm commands, and using a browser tab. This launcher simplifies everything:
 
 - **One‑click start** – launches the harness and opens it in a clean, app‑like Edge window (no browser chrome).
 - **Automatic updates** – checks for new versions on startup and can install them with a single click (or automatically if you prefer).
