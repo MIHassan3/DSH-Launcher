@@ -2,7 +2,7 @@
 ; Compile with: iscc installer.iss   (or run build.ps1, which does everything)
 
 #define AppName    "DSH Launcher"
-#define AppVersion "1.0.0"
+#define AppVersion "0.1.1"
 #define AppPublish "Mohamed"
 #define ExeName    "DSHLauncher.exe"
 
@@ -55,10 +55,16 @@ Type: filesandordirs; Name: "{localappdata}\DeepSeekHarness"
 [Code]
 
 function NodePresent: Boolean;
-var rc: Integer;
 begin
-  Result := Exec(ExpandConstant('{cmd}'), '/c where node >nul 2>&1', '',
-                 SW_HIDE, ewWaitUntilTerminated, rc) and (rc = 0);
+  // Check install locations on disk, not 'where node': PATH inside this
+  // installer process is fixed when it starts, so a just-installed Node.js
+  // would look "missing" even though it is already on disk. Also note the
+  // installer is a 32-bit process, so {pf} would wrongly point at Program
+  // Files (x86): machine-scope Node lives under {pf64}.
+  Result := FileExists(ExpandConstant('{pf64}\nodejs\node.exe')) or
+            FileExists(ExpandConstant('{pf}\nodejs\node.exe')) or
+            FileExists(ExpandConstant('{localappdata}\Programs\nodejs\node.exe')) or
+            FileExists(ExpandConstant('{userpf}\nodejs\node.exe'));
 end;
 
 function WingetPresent: Boolean;
@@ -89,9 +95,11 @@ begin
               'Install it now automatically?', mbConfirmation, MB_YESNO) = IDYES then
     begin
       InstallNode;
+      // No sign-out is needed: the launcher finds Node.js by file path, so a
+      // PATH refresh is not required for it to work.
       if not NodePresent then
-        MsgBox('Node.js still was not detected. You may need to sign out and back in, ' +
-               'or install it manually from nodejs.org.', mbInformation, MB_OK);
+        MsgBox('Node.js still could not be found. Please install the LTS build ' +
+               'from nodejs.org, then start DSH Launcher.', mbInformation, MB_OK);
     end;
   end
   else
