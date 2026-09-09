@@ -51,6 +51,19 @@ This usually means the first‑run profile build failed. Close the app and relau
 - **“Could not clear the old runtime – files are still locked”**
 A previous harness process is still running. Open Task Manager, end all node.exe processes, then relaunch.
 
+## Building from Source
+
+If you want to build the installer yourself:
+
+1. Clone this repository.
+2. Install the required tools:
+   ```powershell
+   Install-Module ps2exe -Scope CurrentUser
+   winget install JRSoftware.InnoSetup
+3. Run build.ps1. The resulting installer will be in the dist folder.
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\build.ps1
+   
 ## License
 This project is licensed under the MIT License – see the LICENSE file for details.
 
