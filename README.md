@@ -24,7 +24,7 @@ The [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) is a powe
 
 ## Installation
 
-1. Download the latest `DSH-Launcher-Setup.exe` from the [Releases](https://github.com/yourusername/dsh-launcher/releases) page.
+1. Download the latest `DSH-Launcher-Setup.exe` from the [Releases](https://github.com/MIHassan3/DSH-Launcher/releases) page.
 2. Run the installer. It will:
    - Install the launcher to your user folder (no admin rights needed).
    - Check for Node.js and offer to install it if missing.
