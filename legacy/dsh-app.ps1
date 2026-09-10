@@ -58,8 +58,10 @@ trap {
     try { $tmsg = [string]$_.Exception.Message } catch { }
     $tline = 0
     try { $tline = $_.InvocationInfo.ScriptLineNumber } catch { }
+    $ttext = ''
+    try { $ttext = ([string]$_.InvocationInfo.Line).Trim() } catch { }
     try {
-        Add-Content (Join-Path $appDir 'crash.log') ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  line ' + $tline + '  ' + $tmsg)
+        Add-Content (Join-Path $appDir 'crash.log') ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  line ' + $tline + '  ' + $tmsg + '  at: ' + $ttext)
     } catch { }
     try {
         if ($splash -and -not $splash.IsDisposed) { $splash.Close() }
@@ -120,9 +122,26 @@ function Get-ProfilePluginCount {
 # ==== version helpers ======================================================
 # Compare dotted versions with an optional prerelease suffix, e.g.
 # "0.1.2-rc.1" < "0.1.2" < "0.1.3-alpha.1". Returns -1, 0 or 1.
+# Input is defensively sanitised: a trailing/leading space or a leading "v" is
+# tolerated, and anything that is not version-shaped is logged and treated as
+# equal. A malformed tag from a registry response must never crash the
+# launcher - a version check is not worth losing a running session over.
 function Compare-DshVersion {
     param([string]$a, [string]$b)
+
+    $a = ([string]$a).Trim()
+    $b = ([string]$b).Trim()
     if ($a -eq $b) { return 0 }
+
+    if ($a -notmatch '^v?\d+(\.\d+)*' -or $b -notmatch '^v?\d+(\.\d+)*') {
+        try {
+            $line = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  version-compare skipped  a=[' + $a + ']  b=[' + $b + ']'
+            Add-Content (Join-Path $appDir 'launcher.log') $line
+        } catch { }
+        return 0
+    }
+    $a = $a -replace '^v', ''
+    $b = $b -replace '^v', ''
 
     function Parse-DshVersion([string]$v, [ref]$nums, [ref]$pre) {
         $v = ($v -split '\+')[0]
@@ -213,6 +232,302 @@ function Install-NodeSilently {
 }
 # ==== end node resolution ==================================================
 
+# ==== launcher self update ==================================================
+# The launcher is a single per-user exe. A newer build is downloaded in the
+# background, verified against the SHA-256 published in the release notes, and
+# staged. The user approves it with a gentle message; the swap (rename the
+# running exe aside, move the new one in) happens on the next start, so the
+# running instance is never touched. None of this runs on the boot path.
+function Get-LauncherExePath {
+    try { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { '' }
+}
+function Get-LauncherVersion {
+    $p = Get-LauncherExePath
+    if ($p -and $p -match 'DSHLauncher\.exe$' -and (Test-Path $p)) {
+        try { return [string][System.Diagnostics.FileVersionInfo]::GetVersionInfo($p).FileVersion } catch { }
+    }
+    '0.1.2.0'   # matches build.ps1; dev .ps1 runs never self-offer older tags
+}
+# ==== update notes helpers (tested by test/unit-release-notes.ps1) ==========
+# Release notes carry one checksum line per asset. Only the line that names the
+# launcher asset is trusted; there is deliberately no loose "find any hash
+# nearby" fallback, so the Setup's checksum can never be picked up by mistake.
+function Get-LauncherChecksumFromNotes([string]$body) {
+    if (-not $body) { return $null }
+    $mm = [regex]::Match($body, '(?im)^\s*Launcher\s+SHA-?256\s*:\s*([0-9a-fA-F]{64})\s*$')
+    if (-not $mm.Success) { return $null }
+    $mm.Groups[1].Value.ToLowerInvariant()
+}
+# ==== end update notes helpers ==============================================
+
+function Test-LauncherUpdateAvailable {
+    # Returns @{ tag; url; checksum } when the published release is newer, or $null.
+    try {
+        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/MIHassan3/DSH-Launcher/releases/latest' `
+            -Headers @{ 'User-Agent' = 'DSH-Launcher' } -TimeoutSec 8
+    } catch { return $null }
+    $tag = [string]$rel.tag_name
+    $cur = Get-LauncherVersion
+    if (-not $tag -or -not $cur) { return $null }
+    if ((Compare-DshVersion ($tag -replace '^v', '') $cur) -le 0) { return $null }
+    $asset = @($rel.assets | Where-Object { $_.name -eq 'DSHLauncher.exe' }) | Select-Object -First 1
+    if (-not $asset) { return $null }
+    # Fail closed: without a published launcher checksum nothing is offered.
+    $checksum = Get-LauncherChecksumFromNotes ([string]$rel.body)
+    if (-not $checksum) { return $null }
+    return @{ tag = $tag; url = [string]$asset.browser_download_url; checksum = $checksum }
+}
+function Invoke-StageLauncherUpdate($info) {
+    $stage = Join-Path $appDir 'launcher.new'
+    $part  = $stage + '.part'
+    try {
+        Invoke-WebRequest -Uri $info.url -OutFile $part -TimeoutSec 90 `
+            -Headers @{ 'User-Agent' = 'DSH-Launcher' }
+        $h = (Get-FileHash $part -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($h -ne $info.checksum) { Remove-Item $part -Force -ErrorAction SilentlyContinue; return $false }
+        $size = (Get-Item $part).Length
+        if ($size -lt 100000) { Remove-Item $part -Force -ErrorAction SilentlyContinue; return $false }
+        Move-Item $part $stage -Force
+        return $true
+    } catch {
+        try { Remove-Item $part -Force -ErrorAction SilentlyContinue } catch { }
+        return $false
+    }
+}
+function Invoke-ApplyStagedLauncherUpdate {
+    # Swap a staged, approved launcher into place. Windows allows renaming the
+    # running exe; this instance keeps running the old image until it exits.
+    $stage = Join-Path $appDir 'launcher.new'
+    $exe = Get-LauncherExePath
+    if (-not (Test-Path $stage)) { return }
+    if (-not $exe -or $exe -match '(powershell|pwsh)(_ise)?\.exe$') { return }
+    if (-not (Test-Path $exe)) { return }
+    if ((Get-Item $stage).Length -lt 100000) { Remove-Item $stage -Force -ErrorAction SilentlyContinue; return }
+    $old = $exe + '.old'
+    try {
+        Remove-Item $old -Force -ErrorAction SilentlyContinue
+        if (Test-Path $exe) { Rename-Item $exe $old -ErrorAction Stop }
+        Move-Item $stage $exe -Force -ErrorAction Stop
+        Remove-Item $old -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $appDir 'launcher.staged.tag') -Force -ErrorAction SilentlyContinue
+    } catch {
+        if (-not (Test-Path $exe) -and (Test-Path $old)) {
+            try { Rename-Item $old $exe -ErrorAction Stop } catch { }
+        }
+    }
+}
+function Test-LauncherSelfUpdateDue {
+    # Throttled to ~once a day and suppressed until the reminder time passes.
+    $s = Get-Settings
+    $now = Get-Date
+    if ($s.launcherLastCheck) {
+        try { if (($now - [datetime]$s.launcherLastCheck).TotalHours -lt 23) { return $null } } catch { }
+    }
+    $s.launcherLastCheck = $now.ToString('o')
+    Save-Settings $s
+    $info = Test-LauncherUpdateAvailable
+    if (-not $info) { return $null }
+    if ($s.launcherRemindAfter) {
+        try { if ($now -lt [datetime]$s.launcherRemindAfter) { return $null } } catch { }
+    }
+    return $info
+}
+function Show-LauncherUpdateOffer($tag) {
+    # Gentle: auto-dismisses after two minutes (treated like Cancel), so it
+    # never blocks the machine. OK applies on the next start, Cancel holds the
+    # current version and asks again later (daily reminder).
+    $r = $shell.Popup("A new DSH Launcher update is ready ($tag).`n`nIt was downloaded and verified.`n`nInstall it the next time you start the app?`n`nOK     - apply it on my next start`nCancel - keep the current version", 120, 'DSH Launcher update', 1 + 32)
+    $s = Get-Settings
+    if ($r -eq 1) {
+        $s.launcherUpdatePending = $true
+        $s.launcherRemindAfter = ''
+    } else {
+        $s.launcherUpdatePending = $false
+        $s.launcherRemindAfter = (Get-Date).AddDays(1).ToString('o')
+    }
+    Save-Settings $s
+}
+
+# ==== resident (tray) helpers ===============================================
+function Show-Balloon($ni, $title, $text) {
+    if ($ni) { try { $ni.ShowBalloonTip(4000, $title, $text, [Windows.Forms.ToolTipIcon]::Info) } catch { } }
+}
+function Start-HarnessQuiet {
+    # Reboot the harness without any splash text; used by the tray Open action.
+    Stop-OrphanHarness
+    $usePort = $Port
+    for ($i = 0; $i -lt 8 -and -not (Test-PortFree $usePort); $i++) { Start-Sleep -Milliseconds 300 }
+    if (-not (Test-PortFree $usePort)) { return $null }
+    Remove-Item $outLog, $errLog -ErrorAction SilentlyContinue
+    $h = $null
+    try {
+        $h = Start-Process -FilePath $nodePath -PassThru -WindowStyle Hidden `
+            -WorkingDirectory $env:USERPROFILE `
+            -ArgumentList "`"$dshBin`"", 'web', '--host', '127.0.0.1', '--port', $usePort, '--no-open' `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+        try { $null = $h.Handle } catch { }
+    } catch { return $null }
+    $deadline = (Get-Date).AddSeconds(120)
+    $u = $null
+    while (-not $u -and (Get-Date) -lt $deadline) {
+        [Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 400
+        $text = ''
+        foreach ($fl in @($outLog, $errLog)) {
+            if (Test-Path $fl) { $text += (Get-Content $fl -Raw -ErrorAction SilentlyContinue) }
+        }
+        $m = [regex]::Match($text, 'https?://(?:localhost|127\.0\.0\.1)(?::\d+)?[^\s"''\)\]]*')
+        if ($m.Success) { $u = $m.Value.TrimEnd('.', ',') }
+        if ($h.HasExited -and -not $u) { break }
+    }
+    if (-not $u) {
+        if (-not $h.HasExited) { Invoke-KillTree $h.Id }
+        $script:harness = $null
+        return $null
+    }
+    $script:harness = $h
+    $script:lastUrl = $u
+    return $u
+}
+function Ensure-HarnessUp {
+    if ($harness -and -not $harness.HasExited) { return $script:lastUrl }
+    Start-HarnessQuiet
+}
+function Open-EdgeWindow {
+    # Open (or reopen) the Edge app window for the running harness.
+    $url2 = Ensure-HarnessUp
+    if (-not $url2) { return $null }
+    if ($script:winEdge -and -not $script:winEdge.HasExited) { return $script:winEdge }
+    $edge = @(
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $edge) { return $null }
+    Initialize-EdgeProfile
+    $p = Start-Process $edge -PassThru -ArgumentList @(
+        "--app=$url2"
+        "--user-data-dir=`"$profileDir`""
+        '--no-first-run'
+        '--no-default-browser-check'
+        '--disable-fre'
+        '--no-service-autorun'
+        '--disable-sync'
+        '--disable-background-mode'
+        '--disable-features=msEdgeWelcomePage,msImplicitSignin,msEdgeSplitScreen'
+    )
+    $script:winEdge = $p
+    $p
+}
+function Check-ResidentUpdates($ni) {
+    # dsh: never install mid-session - announce it, the next launch installs it.
+    $s = Get-Settings
+    $tags = Get-DistTags
+    $installed = Get-InstalledVersion
+    if ($tags -and $installed) {
+        $installed = [string]$installed
+        $isAlphaLine = ($installed -match '-alpha')
+        if ($isAlphaLine) { $myTag = [string]$tags.alpha } else { $myTag = [string]$tags.latest }
+        if ($myTag -and (Compare-DshVersion $myTag $installed) -gt 0 -and $myTag -ne $s.dshNotifiedTag) {
+            $s.dshNotifiedTag = [string]$myTag
+            Save-Settings $s
+            Show-Balloon $ni 'Update pending' "dsh $myTag is available and will install on your next start."
+        }
+    }
+    # launcher: stage in the background, then ask gently.
+    $li = Test-LauncherSelfUpdateDue
+    if ($li) {
+        if (Invoke-StageLauncherUpdate $li) {
+            Show-LauncherUpdateOffer $li.tag
+        }
+    }
+}
+function Enter-TrayLifecycle($firstEdge) {
+    # Resident background mode: closing the window keeps the harness and your
+    # sessions alive. The tray icon reopens the window, stops the harness, or
+    # checks for updates. Returns when the user chooses Exit.
+    $script:winEdge = $firstEdge
+    # A captured hashtable is used for tray actions: assigning to a $script:
+    # variable inside a GetNewClosure() handler does not reach this scope.
+    $tray = @{ action = ''; exit = $false }
+
+    $icon = $null
+    try {
+        $ep = Get-LauncherExePath
+        if ($ep -and (Test-Path $ep)) { $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($ep) }
+    } catch { }
+    if (-not $icon) { try { $icon = [System.Drawing.SystemIcons]::Application } catch { } }
+
+    $ni = New-Object Windows.Forms.NotifyIcon
+    if ($icon) { $ni.Icon = $icon }
+    $ni.Text = 'DeepSeek Harness'
+    $ni.Visible = $true
+
+    $menu = New-Object Windows.Forms.ContextMenuStrip
+    $itOpen  = $menu.Items.Add('Open DeepSeek Harness')
+    $itClose = $menu.Items.Add('Stop the harness')
+    $itCheck = $menu.Items.Add('Check for updates now')
+    [void]$menu.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
+    $itExit  = $menu.Items.Add('Exit DSH Launcher')
+
+    $itOpen.Add_Click({  $tray.action = 'open'  }.GetNewClosure())
+    $itClose.Add_Click({ $tray.action = 'close' }.GetNewClosure())
+    $itCheck.Add_Click({ $tray.action = 'check' }.GetNewClosure())
+    $itExit.Add_Click({  $tray.action = 'exit'  }.GetNewClosure())
+    $ni.Add_MouseDoubleClick({
+        if ($_.Button -eq 'Left') { $tray.action = 'open' }
+    }.GetNewClosure())
+
+    $ni.ContextMenuStrip = $menu
+    Show-Balloon $ni 'Running in the background' 'The harness keeps running when you close the window. Use this icon to reopen it or exit.'
+
+    $lastPeriodic = Get-Date
+
+    while (-not $tray.exit) {
+        [Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 100
+
+        if ($script:winEdge -and $script:winEdge.HasExited) {
+            $script:winEdge = $null
+            Show-Balloon $ni 'Window closed' 'The harness is still running. Reopen it any time from this icon.'
+        }
+
+        $act = $tray.action
+        $tray.action = ''
+        if ($act -eq 'open') {
+            if ($script:winEdge -and -not $script:winEdge.HasExited) {
+                Show-Balloon $ni 'Already open' 'The DeepSeek Harness window is already open.'
+            } elseif (-not (Open-EdgeWindow)) {
+                Show-Balloon $ni 'Could not open' 'The harness did not start. Try again in a moment.'
+            }
+        }
+        elseif ($act -eq 'close') {
+            if ($script:winEdge -and -not $script:winEdge.HasExited) { Invoke-KillTree $script:winEdge.Id }
+            $script:winEdge = $null
+            Stop-Harness
+            Show-Balloon $ni 'Stopped' 'The harness was stopped. Reopen it from this icon when you want it back.'
+        }
+        elseif ($act -eq 'check') {
+            Check-ResidentUpdates $ni
+        }
+        elseif ($act -eq 'exit') {
+            if ($script:winEdge -and -not $script:winEdge.HasExited) { Invoke-KillTree $script:winEdge.Id }
+            $script:winEdge = $null
+            $tray.exit = $true
+        }
+
+        if (((Get-Date) - $lastPeriodic).TotalHours -ge 6) {
+            $lastPeriodic = Get-Date
+            Check-ResidentUpdates $ni
+        }
+    }
+
+    $ni.Visible = $false
+    try { $ni.Dispose() } catch { }
+    try { $menu.Dispose() } catch { }
+    Stop-Harness
+}
+# ==== end resident helpers ==================================================
+
 # Single-instance lock: keep the legacy name for the default data dir so a new
 # build and a still-running old build of the same install block each other;
 # test copies get their own private name instead.
@@ -247,14 +562,30 @@ function Show-Log($title, $body) {
 }
 
 # --- settings ---------------------------------------------------------------
-# autoUpdate : install newer builds of your own channel silently (default on).
-#              Turn it off to be asked before every update instead.
+# autoUpdate            : install newer builds of your own channel silently
+#                         (default on); turn it off to be asked instead.
+# launcherLastCheck     : ISO timestamp of the last launcher-update check.
+# launcherUpdatePending : user approved a staged launcher update (applied on
+#                         the next start, then cleared).
+# launcherRemindAfter   : ISO timestamp; do not ask about the launcher update
+#                         again before this moment (used after a Cancel).
+# dshNotifiedTag        : the dsh version already announced as pending.
 function Get-Settings {
-    $d = @{ autoUpdate = $true }
+    $d = @{
+        autoUpdate = $true
+        launcherLastCheck = ''
+        launcherUpdatePending = $false
+        launcherRemindAfter = ''
+        dshNotifiedTag = ''
+    }
     if (Test-Path $settingsPath) {
         try {
             $j = Get-Content $settingsPath -Raw | ConvertFrom-Json
             if ($null -ne $j.autoUpdate) { $d.autoUpdate = [bool]$j.autoUpdate }
+            if ($j.launcherLastCheck) { $d.launcherLastCheck = [string]$j.launcherLastCheck }
+            if ($null -ne $j.launcherUpdatePending) { $d.launcherUpdatePending = [bool]$j.launcherUpdatePending }
+            if ($j.launcherRemindAfter) { $d.launcherRemindAfter = [string]$j.launcherRemindAfter }
+            if ($j.dshNotifiedTag) { $d.dshNotifiedTag = [string]$j.dshNotifiedTag }
         } catch { }
     }
     $d
@@ -306,12 +637,13 @@ $btnAct.Font      = New-Object Drawing.Font('Segoe UI', 10)
 $btnAct.Visible   = $false
 $btnAct.Text      = ''
 
-# splashChoice: $null = undecided, 'act' = action button used, 'none' = skip
-$script:splashChoice = $null
-$btnAct.Add_Click({ $script:splashChoice = 'act' }.GetNewClosure())
+# splashState.choice: $null = undecided, 'act' = action button used,
+# 'none' = skip. Captured hashtable - see the tray note above.
+$splashState = @{ choice = $null }
+$btnAct.Add_Click({ $splashState.choice = 'act' }.GetNewClosure())
 $splash.Add_KeyDown({
     if ($_.KeyCode -in @([Windows.Forms.Keys]::Enter, [Windows.Forms.Keys]::Escape)) {
-        if ($null -eq $script:splashChoice) { $script:splashChoice = 'none' }
+        if ($null -eq $splashState.choice) { $splashState.choice = 'none' }
     }
 }.GetNewClosure())
 
@@ -337,7 +669,7 @@ function Set-SplashRows($relText, $alpText) {
 # Show (or hide, when $text is empty) the single contextual action button.
 function Set-SplashAction($text) {
     if ($btnAct -and -not $btnAct.IsDisposed) {
-        $script:splashChoice = $null
+        $splashState.choice = $null
         if ([string]$text -eq '') { $btnAct.Visible = $false }
         else { $btnAct.Text = [string]$text; $btnAct.Visible = $true }
     }
@@ -346,19 +678,31 @@ function Set-SplashAction($text) {
 # Pump the splash until the user acts, presses Enter/Esc, or the timeout
 # passes. Returns 'act' or 'none'.
 function Wait-SplashDecision($seconds) {
-    $script:splashChoice = $null
+    $splashState.choice = $null
     $end = (Get-Date).AddSeconds([Math]::Max(0, [int]$seconds))
-    while ($null -eq $script:splashChoice -and (Get-Date) -lt $end) {
+    while ($null -eq $splashState.choice -and (Get-Date) -lt $end) {
         [Windows.Forms.Application]::DoEvents()
         Start-Sleep -Milliseconds 40
     }
-    if ($null -eq $script:splashChoice) { $script:splashChoice = 'none' }
-    $script:splashChoice
+    if ($null -eq $splashState.choice) { $splashState.choice = 'none' }
+    $splashState.choice
 }
 
 # --- single instance --------------------------------------------------------
 $mutex = New-Object System.Threading.Mutex($false, $mutexName)
 if (-not $mutex.WaitOne(0)) { Close-Splash; Say 'DeepSeek Harness is already running.'; exit 0 }
+
+# --- launcher self-update apply ---------------------------------------------
+# A staged, user-approved launcher update from a previous session is swapped in
+# here, before anything UI-related and without touching the boot path. This
+# instance keeps running the old image; every later start is the new version.
+$s0 = Get-Settings
+if ($s0.launcherUpdatePending) {
+    Invoke-ApplyStagedLauncherUpdate
+    $s0.launcherUpdatePending = $false
+    Save-Settings $s0
+}
+$s0 = $null
 
 # --- versions ---------------------------------------------------------------
 function Get-InstalledVersion {
@@ -396,6 +740,7 @@ if ($args -contains '-selftest') {
     $s = Get-Settings
     Write-Host ("  defaults    : autoUpdate={0}" -f $s.autoUpdate)
     Write-Host ("  installed   : {0}" -f (Get-InstalledVersion))
+    Write-Host ("  launcher    : {0}" -f (Get-LauncherVersion))
     Write-Host ("  compare rc/alpha 0.1.2-rc.1 vs 0.1.5-alpha.1 : {0}" -f (Compare-DshVersion '0.1.2-rc.1' '0.1.5-alpha.1'))
     Write-Host ("  compare rc vs release 0.1.2-rc.1 vs 0.1.2 : {0}" -f (Compare-DshVersion '0.1.2-rc.1' '0.1.2'))
     $np = Find-NodeExe
@@ -595,6 +940,14 @@ if ($nodeMajor -gt 0 -and $nodeMajor -lt 18) {
     Stop-Harness
     exit 1
 }
+# npm lifecycle scripts can shell out to `node` (koffi's cnoke build step does
+# exactly that: cmd.exe /c node ./cnoke.cjs ...) and they resolve it through
+# PATH, not through the absolute node path we launched npm with. Prepend the
+# resolved Node directory so this process - and every child it spawns - can
+# find `node`, including when Node was installed after this process started.
+$nodeDir = Split-Path $nodePath
+if ($nodeDir) { $env:PATH = $nodeDir + ';' + $env:PATH }
+
 $npmCli = Join-Path (Split-Path $nodePath) 'node_modules\npm\bin\npm-cli.js'
 if (-not (Test-Path $npmCli)) { $npmCli = $null }   # unusual; fall back below
 
@@ -1006,6 +1359,10 @@ function Initialize-EdgeProfile {
                 (Join-Path $defaultDir 'Last Tabs') -Force -ErrorAction SilentlyContinue
 }
 
+# The harness is up: remember its URL so the tray "Open" action can re-attach
+# to this same instance instead of booting a second one.
+$script:lastUrl = $url
+
 # --- open the window --------------------------------------------------------
 Status 'Opening...'
 
@@ -1062,7 +1419,9 @@ switch ($Mode) {
             Pump 2500
             Close-Splash
             if ($restartAfterOpen) { Invoke-CloseAfterInstall $e }
-            $e.WaitForExit()
+            # Background mode: closing the window keeps the harness running.
+            # The tray icon reopens it or exits; this returns only on Exit.
+            Enter-TrayLifecycle $e
         }
     }
 

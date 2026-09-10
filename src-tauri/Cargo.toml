@@ -1,0 +1,23 @@
+[package]
+name = "dsh-dock"
+version = "0.0.0"
+description = "DSH-Dock - a cross-platform desktop launcher for the official DeepSeek Harness."
+authors = ["DSH-Dock contributors"]
+edition = "2021"
+rust-version = "1.84.0"
+license = "MIT"
+repository = "https://github.com/MIHassan3/DSH-Launcher"
+
+# The library holds the app logic so the Tauri v2 builder stays reusable and
+# mobile-ready; the binary is a thin entry point.
+[lib]
+name = "dsh_dock_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

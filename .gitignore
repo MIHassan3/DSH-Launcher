@@ -1,21 +1,41 @@
-# Build artifacts
-build/
+# DSH-Dock - repository ignore rules.
+#
+# Single source of truth: all ignore rules live in this root file
+# (docs/PROJECT_DSH-DOCK.md section 6). Do not add a src-tauri/.gitignore.
+
+# Dependencies (all levels)
+node_modules/
+
+# Frontend build output
 dist/
+build/
+
+# Rust / Tauri build artifacts
+src-tauri/target/
+
+# Tauri-generated schemas, regenerated on every build
+src-tauri/gen/
+
+# Bundled Node runtime - downloaded at package time, never committed
+src-tauri/binaries/*.exe
+src-tauri/binaries/*.bin
 
 # Logs
 *.log
 
-# User-specific settings (if any)
+# Local npm cache (used when the global cache is unavailable)
+.npm-cache/
+
+# Test scratch output (stdout/port capture from sidecar tests)
+.test-tmp/
+
+# Editor / IDE
+.vs/
+.vscode/
 *.user
 *.suo
 
-# Node modules (if you ever include the runtime)
-node_modules/
-
-# IDE folders (optional)
-.vs/
-.vscode/
-
-# Windows folder artifacts
-desktop.ini
+# OS artifacts
+.DS_Store
 Thumbs.db
+desktop.ini

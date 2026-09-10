@@ -1,0 +1,38 @@
+/* DSH-Dock global styles.
+ *
+ * Palette per docs/PROJECT_DSH-DOCK.md section 9 (Visual Identity).
+ * Phase 0 keeps this deliberately small; full theming arrives with UI work.
+ */
+
+:root {
+  --dsh-primary: #1e3a5f;
+  --dsh-accent: #00b4d8;
+  --dsh-bg: #1a1a1a;
+  --dsh-text: #f0f0f0;
+
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--dsh-bg);
+  color: var(--dsh-text);
+  font-family: "Segoe UI", "SF Pro Text", Inter, system-ui, -apple-system,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  min-height: 100%;
+}

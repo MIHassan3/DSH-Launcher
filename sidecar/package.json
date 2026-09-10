@@ -1,0 +1,12 @@
+{
+  "name": "@dsh-dock/sidecar",
+  "version": "0.0.0",
+  "private": true,
+  "description": "DSH-Dock core logic: version library, registry client, port allocation, harness lifecycle.",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

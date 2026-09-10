@@ -2,7 +2,7 @@
 
 **A simple launcher for the DeepSeek Harness that keeps it always updated and opens it as a desktop app.**
 
-![Version](https://img.shields.io/badge/version-0.1.1-blue)
+![Version](https://img.shields.io/badge/version-0.1.2-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## What is this?
@@ -13,13 +13,14 @@ The [DeepSeek Harness](https://deepseek.com/harness/en/) is a powerful command-l
 - **Automatic updates** - checks for new versions on startup and installs newer builds of your channel silently, keeping you current without any clicks.
 - **Always in control** - the startup window shows one button to switch between the alpha and release channels whenever you want.
 - **Runs in the background** - no console window stays open; the harness runs silently.
+- **Tray + background mode** - closing the window keeps your harness and sessions running; a tray icon reopens it, stops it, checks for updates, or exits.
 - **Simple installer** - a single `.exe` that installs the launcher and optionally Node.js if missing.
 - **Safe updates** - a new build is installed into a staging folder and swapped in only when it verifies, so a failed or interrupted update never breaks the installed version.
 
 ## Requirements
 
 - **Windows 10 or Windows 11** (64-bit)
-- **Node.js** (v18 or later) - the installer, or the launcher itself on first run, can install it for you if missing
+- **Node.js** (v18 or later) - installed automatically by the launcher on first run if it is missing
 - **Microsoft Edge** - already present on all modern Windows systems
 - Internet connection (for first-time installation and updates)
 
@@ -28,7 +29,7 @@ The [DeepSeek Harness](https://deepseek.com/harness/en/) is a powerful command-l
 1. Download the latest `DSH-Launcher-Setup.exe` from the [Releases](https://github.com/MIHassan3/DSH-Launcher/releases) page.
 2. Run the installer. It will:
    - Install the launcher to your user folder (no admin rights needed).
-   - Check for Node.js and offer to install it if missing.
+   - Tell you if Node.js is missing - the launcher installs it for you on first start.
 3. After installation, launch **DSH Launcher** from the Start Menu or desktop shortcut.
 4. On first run, you choose a channel - the latest release or the latest alpha. The harness is then installed and opened in an Edge app window.
 
@@ -42,8 +43,11 @@ The [DeepSeek Harness](https://deepseek.com/harness/en/) is a powerful command-l
   - **Go stable (...)** when you are on the alpha channel - same, back to the release line.
 - **Channels**: "release" follows the `latest` tag (today these are release candidates such as `0.1.2-rc.1`); "alpha" follows the faster-moving `alpha` tag (e.g. `0.1.5-alpha.1`, often ahead of the release line). Which line you are on is decided by the installed build; switching is one click on the startup window.
 - **After an install** the app shows a **"Restart required"** message once the window is up. Click **Close**, then start DSH Launcher again from the Start Menu - the second start connects cleanly.
+- **Staying in the background**: closing the DeepSeek Harness window keeps it (and your sessions) running - the tray icon stays. Right-click it for *Open DeepSeek Harness*, *Stop the harness*, *Check for updates now*, or *Exit DSH Launcher*. Double-click reopens the window.
+- **Launcher updates**: while running, the launcher quietly checks for a newer launcher (once a day) and downloads + verifies it in the background. A gentle message offers it: **OK** applies it on your next start (no reinstall), **Cancel** keeps the current version and reminds you again later. Nothing interrupts what you are doing.
 - **Settings**: stored in `%LOCALAPPDATA%\DeepSeekHarness\settings.json`:
   - `"autoUpdate": true|false` - install newer builds of your own channel silently (default `true`). Turn it off to be asked before every update.
+  - `"launcherUpdatePending"`, `"launcherLastCheck"`, `"launcherRemindAfter"`, `"dshNotifiedTag"` - bookkeeping for the launcher update flow (safe to leave alone).
 
 ## Troubleshooting
 - **"Node.js was not found ..."** (or a failed install saying npm is not recognized)
@@ -75,7 +79,7 @@ Or use the bundled runner:
 .\test\run-isolated.ps1 -Clean # wipe the sandbox afterwards
 ```
 
-The single-instance lock and orphan-process cleanup follow the data dir, so a test copy can never kill or overwrite a real install. Run the unit test for the version logic with `.\test\unit-version.ps1`, and print a headless wiring check with `powershell -File .\Windows\dsh-app.ps1 -selftest`.
+The single-instance lock and orphan-process cleanup follow the data dir, so a test copy can never kill or overwrite a real install. Tests: `.\test\unit-version.ps1` (version comparison, including defensive handling of malformed tags), `.\test\unit-node-path.ps1` (reproduces the npm build-script "node is not recognized" failure and proves the PATH fix), `.\test\unit-closures.ps1` (guards against `$script:` assignments inside `GetNewClosure()` handlers, which silently never propagate), `.\test\unit-events.ps1` (exercises the real WinForms event wiring used by the tray and the startup window, in PowerShell 5.1), `.\test\unit-resident-checks.ps1` (daily launcher-check throttle, the reminder window after Cancel, and the once-per-version resident dsh notice), `.\test\unit-selfupdate-stage.ps1` (download verification/staging: rejects wrong, undersized or missing checksums and never leaves partial files), `.\test\unit-selfupdate-apply.ps1` (drives the staged-update file swap against temp files, including its safe no-op paths), `.\test\unit-release-notes.ps1` (self-update checksum parsing - fails closed and never accepts the Setup hash), `.\test\unit-release-consistency.ps1` (all four version sources agree), and a headless wiring check with `powershell -File .\Windows\dsh-app.ps1 -selftest`.
 
 ## Building from Source
 
