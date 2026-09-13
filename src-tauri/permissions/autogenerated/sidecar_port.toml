@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sidecar-port"
+description = "Enables the sidecar_port command without any pre-configured scope."
+commands.allow = ["sidecar_port"]
+
+[[permission]]
+identifier = "deny-sidecar-port"
+description = "Denies the sidecar_port command without any pre-configured scope."
+commands.deny = ["sidecar_port"]

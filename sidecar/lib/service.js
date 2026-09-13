@@ -13,6 +13,8 @@
 
 import http from "node:http";
 
+import { createHarnessControl } from "./control.js";
+
 export const DEFAULT_HOST = "127.0.0.1";
 
 /**
@@ -28,7 +30,11 @@ export function startService(options = {}) {
   // 0 => OS assigns a free port. Never hardcode a port.
   const requestedPort = options.port ?? 0;
 
-  const server = http.createServer(handleRequest);
+  // One control instance per server, so the in-flight-start lock is scoped to
+  // this sidecar and cannot be shared across servers by accident.
+  const control = options.control ?? createHarnessControl(options.controlOptions ?? {});
+
+  const server = http.createServer(createRequestHandler(control));
   // Responses are small JSON payloads; Nagle only adds latency here.
   server.keepAliveTimeout = 5000;
 
@@ -52,14 +58,26 @@ export function startService(options = {}) {
         host,
         port: address.port,
         server,
+        /** The lifecycle control surface, exposed for tests and diagnostics. */
+        control,
 
         /** Graceful shutdown. Idempotent. */
         dispose() {
           if (disposed) return Promise.resolve();
           disposed = true;
-          return new Promise((resolveClose) => {
-            server.close(() => resolveClose());
-          });
+          // Wait out any in-flight start FIRST. Closing the server while a
+          // spawn is still settling would abandon a harness mid-boot: it would
+          // be running with no state file recorded, i.e. an orphan on the next
+          // launch. `settled()` never rejects.
+          return Promise.resolve()
+            .then(() => control?.settled?.())
+            .catch(() => {})
+            .then(
+              () =>
+                new Promise((resolveClose) => {
+                  server.close(() => resolveClose());
+                }),
+            );
         },
       });
     };
@@ -70,25 +88,62 @@ export function startService(options = {}) {
   });
 }
 
-function handleRequest(req, res) {
-  // Phase 0 has exactly one endpoint. Phase 1 adds the control surface.
-  if (req.method === "GET" && req.url === "/health") {
-    // Logged to stderr, never stdout: stdout must carry only the handshake.
-    // This is also a useful Phase 0 proof that the shell can reach the
-    // announced port from outside the Node process.
-    process.stderr.write(
-      `[sidecar] shell connected from ${req.socket.remoteAddress ?? "unknown"}\n`,
-    );
-    sendJson(res, 200, {
-      ok: true,
-      service: "dsh-dock-sidecar",
-      pid: process.pid,
-      node: process.version,
-    });
-    return;
-  }
+function createRequestHandler(control) {
+  return (req, res) => {
+    // `/health` is sidecar liveness, not harness status. Keep its shape stable.
+    if (req.method === "GET" && req.url === "/health") {
+      // Logged to stderr, never stdout: stdout must carry only the handshake.
+      // This is also a useful proof that the shell can reach the announced port
+      // from outside the Node process.
+      process.stderr.write(
+        `[sidecar] shell connected from ${req.socket.remoteAddress ?? "unknown"}\n`,
+      );
+      sendJson(res, 200, {
+        ok: true,
+        service: "dsh-dock-sidecar",
+        pid: process.pid,
+        node: process.version,
+      });
+      return;
+    }
 
-  sendJson(res, 404, { ok: false, error: "not_found" });
+    let pathname;
+    try {
+      pathname = new URL(req.url ?? "/", `http://${DEFAULT_HOST}`).pathname;
+    } catch {
+      sendJson(res, 400, { ok: false, error: "bad_request" });
+      return;
+    }
+
+    if (control === null || control === undefined) {
+      sendJson(res, 404, { ok: false, error: "not_found" });
+      return;
+    }
+
+    // Control routes are async (a status reads state and probes a URL; a start
+    // spawns in the background). Errors must never escape as an unhandled
+    // rejection or a hung socket.
+    Promise.resolve()
+      .then(() => control.handle(req.method, pathname))
+      .then((result) => {
+        if (result === null || result === undefined) {
+          sendJson(res, 404, { ok: false, error: "not_found", path: pathname });
+          return;
+        }
+        sendJson(res, result.code, result.payload);
+      })
+      .catch((error) => {
+        // A thrown error is a first-class response (no swallowed errors). The
+        // control layer already attaches log tails to its own failures; this
+        // catch covers anything that escaped it.
+        process.stderr.write(`[sidecar] control route ${pathname} threw: ${error.message}\n`);
+        sendJson(res, 500, {
+          status: "error",
+          message: error.message,
+          lastError: error.message,
+        });
+      });
+  };
 }
 
 function sendJson(res, statusCode, payload) {

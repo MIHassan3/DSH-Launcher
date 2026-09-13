@@ -17,7 +17,53 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# `custom-protocol` is ON BY DEFAULT, and that is load-bearing.
+#
+# In tauri's own build.rs:
+#
+#     let dev = !custom_protocol;
+#     alias("dev", dev);
+#
+# so `cfg(dev)` - and therefore `Tauri::is_dev()` - is driven PURELY by this
+# feature, independently of the cargo profile. Declaring a `[features]` table
+# without a `default` list means the feature is OFF unless someone asks for it,
+# so `cargo build --release` produced a DEV-MODE binary: it had no embedded
+# assets and tried to fetch the frontend from `build.devUrl`
+# (http://127.0.0.1:1420) at runtime. With no Vite server running the window
+# opened but the dashboard showed ERR_CONNECTION_REFUSED.
+#
+# Making it the default means every build is a production build unless something
+# explicitly opts out. `tauri dev` adds `--no-default-features` itself, so the
+# dev flow is unaffected.
+#
+# CONSEQUENCE FOR TESTING: release acceptance MUST run the release binary with
+# NO dev server. A debug binary - or a release binary with Vite still listening
+# on 1420 - will pass even while this feature is missing.
+custom-protocol = ["tauri/custom-protocol"]
+default = ["custom-protocol"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Blocking HTTP client used ONLY to proxy the three control commands to the
+# sidecar on loopback (127.0.0.1).
+#
+# Default features are OFF on purpose: the default set pulls in rustls + ring +
+# webpki-roots to provide TLS, which this shell can never need - it talks to a
+# plain-HTTP loopback port and to nothing else. Disabling them keeps the binary
+# and the dependency tree small, and removes an entire crypto stack from the
+# launcher's attack surface.
+#
+# Consequence: an https:// URL would fail at runtime with "TLS support not
+# compiled in". That is the correct failure for a shell that has no business
+# making outbound TLS requests.
+ureq = { version = "3", default-features = false, features = ["json"] }
+
+# Only for `tokio::time::timeout`, which bounds the harness window's re-navigate
+# call. tokio is ALREADY in the dependency tree (Tauri depends on it with
+# rt/rt-multi-thread/sync/fs/io-util); this adds the `time` feature and pulls in
+# no new crate. It exists because a wedged WebView2 must never hold a launcher
+# command open without limit.
+tokio = { version = "1", features = ["time"] }

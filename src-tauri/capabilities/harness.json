@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "harness-window",
+  "description": "Scopes the remote harness origin. Grants NO commands.",
+  "windows": ["harness"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*"]
+  },
+  "permissions": ["core:default"]
+}

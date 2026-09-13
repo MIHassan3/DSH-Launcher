@@ -16,8 +16,10 @@
 /**
  * Minimum harness version DSH-Dock supports.
  *
- * PLACEHOLDER "0.0.0". The real value is set in Phase 1 once we query the npm
- * registry and can choose it from actual published versions. Do not guess it.
+ * PLACEHOLDER "0.0.0". The real value is set in Phase 2, once DSH-Dock has
+ * actually installed and booted a real harness version and can derive the floor
+ * from evidence. Do not guess it - the constant is a claim about what has been
+ * verified working, and Phase 1 verifies nothing yet.
  *
  * Behaviour when a user selects a version below this (section 3.2): allow it,
  * warn once, never block. The user is sovereign.

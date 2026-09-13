@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-harness-status"
+description = "Enables the harness_status command without any pre-configured scope."
+commands.allow = ["harness_status"]
+
+[[permission]]
+identifier = "deny-harness-status"
+description = "Denies the harness_status command without any pre-configured scope."
+commands.deny = ["harness_status"]

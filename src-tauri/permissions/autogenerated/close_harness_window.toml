@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-close-harness-window"
+description = "Enables the close_harness_window command without any pre-configured scope."
+commands.allow = ["close_harness_window"]
+
+[[permission]]
+identifier = "deny-close-harness-window"
+description = "Denies the close_harness_window command without any pre-configured scope."
+commands.deny = ["close_harness_window"]
