@@ -1,6 +1,6 @@
 {
   "name": "dsh-dock",
-  "version": "0.0.0",
+  "version": "0.5.0",
   "private": true,
   "description": "DSH-Dock - a cross-platform desktop launcher for the official DeepSeek Harness (dsh).",
   "license": "MIT",

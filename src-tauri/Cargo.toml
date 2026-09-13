@@ -1,6 +1,6 @@
 [package]
 name = "dsh-dock"
-version = "0.0.0"
+version = "0.5.0"
 description = "DSH-Dock - a cross-platform desktop launcher for the official DeepSeek Harness."
 authors = ["DSH-Dock contributors"]
 edition = "2021"
