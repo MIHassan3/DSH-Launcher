@@ -35,6 +35,14 @@ Control the harness from a clean native window — start it, stop it, see what v
   <img src="docs/assets/screenshots/01-dashboard-idle.png" alt="DSH-Dock dashboard, idle state" width="720">
 </p>
 
+### Starting the harness
+
+Click **Start Harness** and the dashboard shows live progress while the harness boots. First boot installs the harness; subsequent boots are much faster.
+
+<p align="center">
+  <img src="docs/assets/screenshots/01-dashboard-starting.png" alt="DSH-Dock dashboard, starting state" width="720">
+</p>
+
 ### Running
 
 Once the harness is up, the dashboard shows its version, process ID, port URL, and start time. The harness runs in the background — closing the launcher doesn't stop it.
