@@ -893,97 +893,259 @@ fn close_harness_window(app: tauri::AppHandle) -> HarnessWindowState {
     HarnessWindowState { open: false, url: None }
 }
 
-/// Resolves the repository root AT RUNTIME, from the running executable.
+/// Where the sidecar entry point was found.
 ///
-/// WHY THIS IS NOT `env!("CARGO_MANIFEST_DIR")`: that macro is evaluated when
-/// the binary is COMPILED, so the absolute build-host path gets baked into the
-/// executable. A release build copied to any other machine then looks for the
-/// sidecar under the build host's directory, fails to find it, and (because a
-/// release build has no console - see main.rs) fails silently. That was a real
-/// release blocker: the dashboard rendered, no `node.exe` was ever spawned, and
-/// nothing said why.
-///
-/// The walk is derived from `current_exe()`, so it is correct wherever the
-/// binary is placed:
-///
-///   <root>/src-tauri/target/release/dsh-dock.exe   -> 4 ancestors -> <root>
-///   <root>/src-tauri/target/debug/dsh-dock.exe     -> 4 ancestors -> <root>
-///
-/// Candidates are probed by looking for the sidecar entry point, not by
-/// counting directories blindly: a copied or nested layout still resolves as
-/// long as `sidecar/index.js` sits at some ancestor. The walk is bounded, and
-/// the error names every directory that was tried.
-///
-/// TODO(Phase 4): replace this with `app.path().resource_dir()` once the
-/// sidecar ships as a bundled resource (`resources/sidecar/index.js`) alongside
-/// the bundled Node binary (`binaries/node(.exe)`). Then no repository walk is
-/// needed at all and this function can be deleted.
-pub fn resolve_repo_root() -> Result<PathBuf, String> {
-    resolve_repo_root_from(std::env::current_exe().ok())
+/// Recorded rather than inferred so the log line can say which mode the launcher
+/// is in, and so a future failure can name the branch that used to work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum SidecarSource {
+    /// `<exe-dir>/sidecar/index.js`.
+    ///
+    /// The installed layout: Tauri's Windows bundler writes `bundle.resources`
+    /// entries beside the executable, verified by installing to a throwaway
+    /// directory and listing the payload. Also matches a development build that
+    /// happens to have a sidecar next to it.
+    AdjacentToExe,
+    /// `<resource-dir>/sidecar/index.js`.
+    ///
+    /// Tauri's `resource_dir()`. On Windows this is the exe directory itself, so
+    /// this branch duplicates `AdjacentToExe` there rather than adding anything.
+    /// It exists for macOS (`<exe-dir>/../Resources`) and Linux, where the
+    /// resource directory is genuinely elsewhere.
+    ResourceDir,
+    /// A repository checkout found by walking up from the exe directory.
+    RepositoryWalk,
 }
 
-/// Testable core of [`resolve_repo_root`]: takes the exe path explicitly.
-pub fn resolve_repo_root_from(exe: Option<PathBuf>) -> Result<PathBuf, String> {
+/// A resolved sidecar entry point plus the working directory it must run from.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResolvedSidecar {
+    /// Directory to use as the child process's working directory.
+    ///
+    /// Always the directory CONTAINING `sidecar/`, never the parent of the exe,
+    /// because `spawn_sidecar` runs `node sidecar/index.js` relative to it.
+    pub root: PathBuf,
+    /// Absolute path to `sidecar/index.js`.
+    pub entry: PathBuf,
+    /// Which branch resolved it.
+    pub source: SidecarSource,
+}
+
+impl ResolvedSidecar {
+    /// Suffix used in the startup log, so one glance says which mode is running.
+    pub fn describe(&self) -> &'static str {
+        match self.source {
+            SidecarSource::AdjacentToExe => "installed build, sidecar adjacent to exe",
+            SidecarSource::ResourceDir => "installed build, sidecar in the resource directory",
+            SidecarSource::RepositoryWalk => "dev build",
+        }
+    }
+}
+
+/// Why resolution failed, including every location that was probed.
+#[derive(Debug, Clone)]
+pub struct ResolveFailure {
+    /// Locations tried, in order, for the loud error message.
+    pub tried: Vec<PathBuf>,
+}
+
+/// The launcher's `sidecar/index.js`, relative to whichever root holds it.
+const SIDECAR_ENTRY_RELATIVE: [&str; 2] = ["sidecar", "index.js"];
+
+/// Joins the relative sidecar entry onto a root.
+fn sidecar_entry_in(root: &std::path::Path) -> PathBuf {
+    root.join(SIDECAR_ENTRY_RELATIVE[0]).join(SIDECAR_ENTRY_RELATIVE[1])
+}
+
+/// Resolves the sidecar entry point for the running launcher.
+///
+/// THREE BRANCHES, IN ORDER:
+///
+///   1. `<exe-dir>/sidecar/index.js` - the installed layout on Windows, and a
+///      dev build with an adjacent sidecar.
+///   2. `<resource-dir>/sidecar/index.js` - cross-platform correctness. Harmless
+///      duplication on Windows; the branch that matters on macOS/Linux.
+///   3. Walk up from `<exe-dir>` for a directory holding BOTH `package.json` and
+///      `sidecar/index.js` - a repository checkout, i.e. `cargo tauri dev`.
+///
+/// Deliberately NOT probed: `<resource-dir>/resources/sidecar/`. That directory
+/// exists beside an installed Windows exe (the bundler puts the app icon there)
+/// but does NOT contain the sidecar, so checking it would be a false-positive
+/// branch that reports success while pointing at nothing.
+///
+/// WHY NOT `env!("CARGO_MANIFEST_DIR")`: that macro is evaluated when the binary
+/// is COMPILED, so the build host's absolute path is baked into the executable
+/// and a binary copied elsewhere looks for the sidecar on the build machine.
+/// Everything here derives from `current_exe()` at runtime instead.
+pub fn resolve_sidecar() -> Result<ResolvedSidecar, ResolveFailure> {
+    resolve_sidecar_from(
+        std::env::current_exe().ok(),
+        resource_dir_for_running_app(),
+    )
+}
+
+/// The resource directory of the running app, or None if unavailable.
+///
+/// Kept separate so the resolver core stays testable without a running Tauri app.
+fn resource_dir_for_running_app() -> Option<PathBuf> {
+    // `AppHandle` is not available this early, and `resource_dir()` is a method
+    // on the path resolver. `tauri::utils::platform::resource_dir` needs package
+    // info, which we do not have here either - so the directory is derived from
+    // the executable exactly as Tauri does on desktop, and the real
+    // `app.path().resource_dir()` is used when it is reachable.
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?.to_path_buf();
+
+    // Mirrors tauri-utils' desktop rule: on Windows the resources live beside the
+    // executable; on macOS they are in the .app's Resources directory.
+    #[cfg(target_os = "macos")]
+    {
+        return Some(exe_dir.parent()?.join("Resources"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(exe_dir)
+    }
+}
+
+/// Testable core of [`resolve_sidecar`]: every input supplied explicitly.
+///
+/// `resource_dir` is injected rather than discovered so the resource-directory
+/// branch can be exercised on Windows, where it would otherwise be
+/// indistinguishable from the exe-adjacent branch.
+pub fn resolve_sidecar_from(
+    exe: Option<PathBuf>,
+    resource_dir: Option<PathBuf>,
+) -> Result<ResolvedSidecar, ResolveFailure> {
     let mut tried: Vec<PathBuf> = Vec::new();
 
-    if let Some(exe) = exe {
-        if let Some(dir) = exe.parent() {
-            // Five levels covers `target/<profile>` plus a couple of extra
-            // layouts; the entry-point probe below is what actually decides.
-            let mut candidate = Some(dir.to_path_buf());
-            for _ in 0..5 {
-                let Some(current) = candidate else { break };
-                if current.join("sidecar").join("index.js").is_file() {
-                    return Ok(current);
-                }
-                tried.push(current.clone());
-                candidate = current.parent().map(|parent| parent.to_path_buf());
-            }
-        } else {
-            tried.push(PathBuf::from(format!("(no parent for {})", exe.display())));
+    let exe_dir = exe
+        .as_ref()
+        .and_then(|exe| exe.parent().map(|parent| parent.to_path_buf()));
+
+    // --- Branch 1: adjacent to the executable --------------------------------
+    if let Some(dir) = exe_dir.as_ref() {
+        let entry = sidecar_entry_in(dir);
+        if entry.is_file() {
+            return Ok(ResolvedSidecar {
+                root: dir.clone(),
+                entry,
+                source: SidecarSource::AdjacentToExe,
+            });
         }
+        tried.push(entry);
+    } else if let Some(exe) = exe.as_ref() {
+        tried.push(PathBuf::from(format!("(no parent for {})", exe.display())));
     } else {
         tried.push(PathBuf::from("(could not determine the executable path)"));
     }
 
-    // Last resort: the process working directory. Only consulted if the exe
-    // walk failed, so a launcher started from the repo root inside a strange
-    // directory layout still works.
-    if let Ok(cwd) = std::env::current_dir() {
-        if cwd.join("sidecar").join("index.js").is_file() {
-            return Ok(cwd);
+    // --- Branch 2: the resource directory ------------------------------------
+    if let Some(dir) = resource_dir.as_ref() {
+        let entry = sidecar_entry_in(dir);
+        // Skip when it duplicates branch 1: re-probing the same path would add a
+        // misleading second entry to the error list.
+        if Some(dir) != exe_dir.as_ref() {
+            if entry.is_file() {
+                return Ok(ResolvedSidecar {
+                    root: dir.clone(),
+                    entry,
+                    source: SidecarSource::ResourceDir,
+                });
+            }
+            tried.push(entry);
         }
-        tried.push(cwd);
     }
 
-    let looked = tried
+    // --- Branch 3: walk up looking for a repository checkout -----------------
+    //
+    // Both markers are required. `sidecar/index.js` alone is not enough: a
+    // packaged `target/release/` layout could otherwise be mistaken for a repo.
+    // `package.json` is what distinguishes a real checkout of this project.
+    if let Some(dir) = exe_dir.as_ref() {
+        let mut candidate = Some(dir.clone());
+        for _ in 0..5 {
+            let Some(current) = candidate else { break };
+
+            // Branch 1 already covered the starting directory; do not re-probe.
+            if Some(&current) != exe_dir.as_ref() || tried.is_empty() {
+                let entry = sidecar_entry_in(&current);
+                if entry.is_file() && current.join("package.json").is_file() {
+                    return Ok(ResolvedSidecar {
+                        root: current.clone(),
+                        entry,
+                        source: SidecarSource::RepositoryWalk,
+                    });
+                }
+                if current.join("package.json").is_file() || entry.is_file() {
+                    tried.push(entry);
+                }
+            }
+
+            candidate = current.parent().map(|parent| parent.to_path_buf());
+        }
+    }
+
+    // Last resort: the process working directory, for a launcher started from
+    // the repo root under an unusual layout.
+    if let Ok(cwd) = std::env::current_dir() {
+        let entry = sidecar_entry_in(&cwd);
+        if entry.is_file() && cwd.join("package.json").is_file() {
+            return Ok(ResolvedSidecar {
+                root: cwd,
+                entry,
+                source: SidecarSource::RepositoryWalk,
+            });
+        }
+        tried.push(entry);
+    }
+
+    Err(ResolveFailure { tried })
+}
+
+/// Formats [`ResolveFailure`] as the loud, actionable startup error.
+pub fn describe_resolve_failure(failure: &ResolveFailure) -> String {
+    let looked = failure
+        .tried
         .iter()
         .map(|path| format!("\n    {}", path.display()))
         .collect::<String>();
-    Err(format!(
-        "Could not find sidecar/index.js. Searched, starting from the running \
-         executable:{looked}\n\
-         The launcher expects the repository layout (<root>/sidecar/index.js). \
-         A packaged build ships the sidecar as a bundled resource instead \
-         (TODO(Phase 4))."
-    ))
+    format!(
+        "Could not find the sidecar entry point (sidecar/index.js).\n\
+         Searched, starting from the running executable:{looked}\n\
+         An installed build ships it beside the executable; a development build \
+         runs from a repository checkout. If this is an installed build, the \
+         installer is missing the sidecar resource."
+    )
 }
 
 /// Spawns the sidecar and wires its handshake into application state.
 fn spawn_sidecar(app: &tauri::AppHandle) -> Result<(), String> {
-    let root = resolve_repo_root()?;
-    let entry = root.join("sidecar").join("index.js");
+    let resolved = match resolve_sidecar() {
+        Ok(resolved) => resolved,
+        Err(failure) => {
+            // The loud failure lists every path probed, so a packaging mistake is
+            // diagnosable from launcher.log alone.
+            let message = describe_resolve_failure(&failure);
+            log_line(&format!("spawn: FAILED - {message}"));
+            return Err(message);
+        }
+    };
 
-    log_line(&format!("spawn: repository root resolved to {}", root.display()));
+    // One line that says which mode the launcher is running in, so log triage
+    // does not require guessing from the path alone.
+    log_line(&format!(
+        "spawn: repository root resolved to {} ({})",
+        resolved.root.display(),
+        resolved.describe()
+    ));
 
-    if !entry.is_file() {
-        // Kept as a separate check so the message can name the exact file. The
-        // resolver above already probes this path, so this is now a race or a
-        // permissions problem rather than a layout problem.
+    // The resolver proved this is a file, so this is now a race or a permissions
+    // problem rather than a layout problem.
+    if !resolved.entry.is_file() {
         let message = format!(
-            "Sidecar entry point not found at {}. The launcher runs the sidecar \
-             from the repository, so it expects a full checkout next to the binary.",
-            entry.display()
+            "Sidecar entry point disappeared after resolution: {}",
+            resolved.entry.display()
         );
         log_line(&format!("spawn: FAILED - {message}"));
         return Err(message);
@@ -1001,10 +1163,18 @@ fn spawn_sidecar(app: &tauri::AppHandle) -> Result<(), String> {
     // window appeared on a release build as a result. Piping keeps the child
     // console-free, and the reader thread below forwards the text into
     // launcher.log so nothing is lost.
+    // The entry point is passed ABSOLUTE and the working directory is the
+    // directory CONTAINING `sidecar/`.
+    //
+    // The target platform matters here: on Windows a relatively-invoked node
+    // stores a shortened command line, which breaks the identity check that
+    // adopt/reap relies on (`identifyHarness` matches the recorded install
+    // directory from the command line). An absolute path keeps that working for
+    // both the repository layout and an installed build.
     let mut command = Command::new("node");
     command
-        .arg("sidecar/index.js")
-        .current_dir(&root)
+        .arg(&resolved.entry)
+        .current_dir(&resolved.root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(if SIDECAR_STDERR_INHERITED { Stdio::inherit() } else { Stdio::piped() });
@@ -1296,66 +1466,184 @@ mod tests {
         assert_eq!(EVENT_SIDECAR_ERROR, "sidecar:error");
     }
 
-    // --- release-build path resolution -------------------------------------
+    // --- sidecar path resolution -------------------------------------------
     //
-    // These are the regression tests for the release blocker: the sidecar path
-    // must be derived from the RUNNING binary, never from a compile-time
-    // constant, so a build copied to another machine still finds its sidecar.
+    // Regression tests for two separate release bugs:
+    //
+    //   * the path must derive from the RUNNING binary, never from a compile-time
+    //     constant, so a build copied to another machine still finds its sidecar;
+    //   * the resolver must find a sidecar that ships BESIDE the executable,
+    //     which is what the installer produces on Windows.
 
-    /// Creates a fake checkout at `<tmp>/root` with `sidecar/index.js` present.
+    /// Creates a fake repository checkout: `package.json` + `sidecar/index.js`.
     fn make_fake_checkout(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("dsh-dock-path-test-{tag}"));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sidecar")).unwrap();
         std::fs::write(root.join("sidecar").join("index.js"), "// fixture\n").unwrap();
+        std::fs::write(root.join("package.json"), "{}\n").unwrap();
         root
     }
 
+    /// Creates a fake INSTALLED layout: sidecar resources beside the exe.
+    fn make_fake_install(tag: &str) -> PathBuf {
+        let install = std::env::temp_dir().join(format!("dsh-dock-install-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&install);
+        std::fs::create_dir_all(install.join("sidecar").join("lib")).unwrap();
+        std::fs::write(install.join("sidecar").join("index.js"), "// fixture\n").unwrap();
+        std::fs::write(install.join("sidecar").join("lib").join("state.js"), "// fixture\n").unwrap();
+        // Mirrors a real install: the bundler's own resources dir exists beside
+        // the exe and holds the icon, NOT the sidecar.
+        std::fs::create_dir_all(install.join("resources")).unwrap();
+        std::fs::write(install.join("resources").join("icon.ico"), "icon").unwrap();
+        std::fs::write(install.join("dsh-dock.exe"), "exe").unwrap();
+        install
+    }
+
+    fn cleanup(root: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
-    fn resolves_the_root_from_a_release_binary_location() {
+    fn finds_a_sidecar_adjacent_to_the_executable() {
+        // The installed layout on Windows: this is the branch that fixes the
+        // shipped installer, so it is asserted first and explicitly.
+        let install = make_fake_install("adjacent");
+        let exe = install.join("dsh-dock.exe");
+
+        let resolved = resolve_sidecar_from(Some(exe), None).expect("installed layout must resolve");
+
+        assert_eq!(resolved.source, SidecarSource::AdjacentToExe);
+        assert_eq!(resolved.root, install);
+        assert_eq!(resolved.entry, install.join("sidecar").join("index.js"));
+        assert_eq!(
+            resolved.describe(),
+            "installed build, sidecar adjacent to exe",
+            "the log line must name the mode"
+        );
+
+        cleanup(&install);
+    }
+
+    #[test]
+    fn the_resources_subdirectory_beside_the_exe_is_not_a_false_positive() {
+        // A real install has `resources/` beside the exe (the bundler puts the
+        // icon there) but NOT `resources/sidecar/`. If the resolver ever probed
+        // that path it would report success while pointing at nothing.
+        let install = make_fake_install("falsepositive");
+        let exe = install.join("dsh-dock.exe");
+
+        let resolved = resolve_sidecar_from(Some(exe), Some(install.join("resources"))).unwrap();
+
+        // Must still be the exe-adjacent branch, and the entry must be a real file.
+        assert_eq!(resolved.source, SidecarSource::AdjacentToExe);
+        assert!(resolved.entry.is_file(), "entry must exist: {}", resolved.entry.display());
+        assert!(
+            !resolved.entry.starts_with(install.join("resources")),
+            "must not resolve into the resources directory"
+        );
+
+        cleanup(&install);
+    }
+
+    #[test]
+    fn finds_a_sidecar_in_an_external_resource_directory() {
+        // Window's `resource_dir()` is the exe dir, so this branch cannot fire
+        // there - it exists for macOS (`<exe-dir>/../Resources`) and Linux. The
+        // resource dir is injected so the branch is exercised on any host.
+        let install = make_fake_install("resourcedir");
+        // Exe in `bin/`, resources in a SIBLING directory - no sidecar beside it.
+        let bin = install.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("dsh-dock.exe");
+        std::fs::write(&exe, "exe").unwrap();
+
+        let resources = install.join("Resources");
+        std::fs::create_dir_all(resources.join("sidecar")).unwrap();
+        std::fs::write(resources.join("sidecar").join("index.js"), "// fixture\n").unwrap();
+
+        let resolved = resolve_sidecar_from(Some(exe), Some(resources.clone())).unwrap();
+
+        assert_eq!(resolved.source, SidecarSource::ResourceDir);
+        assert_eq!(resolved.root, resources);
+        assert_eq!(
+            resolved.describe(),
+            "installed build, sidecar in the resource directory"
+        );
+
+        cleanup(&install);
+    }
+
+    #[test]
+    fn finds_a_repository_checkout_by_walking_up() {
+        // `cargo tauri dev`: the exe lives in target/<profile>/ inside a checkout.
         let root = make_fake_checkout("release");
-        // <root>/src-tauri/target/release/dsh-dock.exe -> 4 ancestors.
         let exe = root
             .join("src-tauri")
             .join("target")
             .join("release")
             .join("dsh-dock.exe");
-        let resolved = resolve_repo_root_from(Some(exe)).expect("release layout must resolve");
-        assert_eq!(resolved, root);
 
-        // The debug layout must resolve identically, and the resolved directory
-        // must be independent of where the binary lives.
+        let resolved = resolve_sidecar_from(Some(exe), None).expect("repo layout must resolve");
+        assert_eq!(resolved.source, SidecarSource::RepositoryWalk);
+        assert_eq!(resolved.root, root);
+        assert_eq!(resolved.describe(), "dev build");
+
+        // The debug profile must resolve identically.
         let debug_exe = root
             .join("src-tauri")
             .join("target")
             .join("debug")
             .join("dsh-dock.exe");
-        assert_eq!(resolve_repo_root_from(Some(debug_exe)).unwrap(), root);
+        assert_eq!(
+            resolve_sidecar_from(Some(debug_exe), None).unwrap().root,
+            root
+        );
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn the_repo_walk_requires_package_json_not_just_a_sidecar_dir() {
+        // `sidecar/index.js` alone must not be mistaken for a checkout: a
+        // partially-copied directory could otherwise be treated as a repo.
+        let root = std::env::temp_dir().join("dsh-dock-path-test-noPkg");
         let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sidecar")).unwrap();
+        std::fs::write(root.join("sidecar").join("index.js"), "// fixture\n").unwrap();
+
+        let exe = root.join("sub").join("dsh-dock.exe");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(&exe, "exe").unwrap();
+
+        assert!(
+            resolve_sidecar_from(Some(exe), None).is_err(),
+            "a sidecar without package.json is not a checkout"
+        );
+
+        cleanup(&root);
     }
 
     #[test]
     fn resolution_does_not_depend_on_the_binary_path() {
-        // The whole point of the fix: two different absolute locations, same
-        // answer relative to their own tree.
+        // Two different absolute locations, each resolved relative to its own tree.
         let root_a = make_fake_checkout("path-a");
         let root_b = make_fake_checkout("path-b-with-a-longer-name");
 
         let exe_a = root_a.join("src-tauri/target/release/dsh-dock.exe");
         let exe_b = root_b.join("src-tauri/target/release/dsh-dock.exe");
 
-        assert_eq!(resolve_repo_root_from(Some(exe_a)).unwrap(), root_a);
-        assert_eq!(resolve_repo_root_from(Some(exe_b)).unwrap(), root_b);
+        assert_eq!(resolve_sidecar_from(Some(exe_a), None).unwrap().root, root_a);
+        assert_eq!(resolve_sidecar_from(Some(exe_b), None).unwrap().root, root_b);
 
-        let _ = std::fs::remove_dir_all(&root_a);
-        let _ = std::fs::remove_dir_all(&root_b);
+        cleanup(&root_a);
+        cleanup(&root_b);
     }
 
     #[test]
     fn resolves_through_an_extra_directory_level() {
         // A copied tree with an extra wrapper directory still resolves, because
-        // candidates are probed for sidecar/index.js rather than counted blindly.
+        // candidates are probed for the entry point rather than counted blindly.
         let root = make_fake_checkout("nested");
         let exe = root
             .join("extra")
@@ -1363,31 +1651,37 @@ mod tests {
             .join("target")
             .join("release")
             .join("dsh-dock.exe");
-        assert_eq!(resolve_repo_root_from(Some(exe)).unwrap(), root);
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(resolve_sidecar_from(Some(exe), None).unwrap().root, root);
+        cleanup(&root);
     }
 
     #[test]
-    fn a_missing_sidecar_is_reported_with_the_searched_paths() {
+    fn a_missing_sidecar_fails_loudly_and_lists_every_path_tried() {
         let root = std::env::temp_dir().join("dsh-dock-path-test-missing");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src-tauri/target/release")).unwrap();
 
         let exe = root.join("src-tauri/target/release/dsh-dock.exe");
-        let error = resolve_repo_root_from(Some(exe)).expect_err("must fail without a sidecar");
+        let failure = resolve_sidecar_from(Some(exe), None).expect_err("must fail without a sidecar");
+        let message = describe_resolve_failure(&failure);
 
-        // The message must be actionable: it names the file, and lists where it
-        // looked, so a user can see exactly what the launcher expected.
-        assert!(error.contains("sidecar/index.js"), "{error}");
-        assert!(error.contains("release"), "{error}");
+        // Actionable: it names the file and lists where it looked.
+        assert!(message.contains("sidecar/index.js"), "{message}");
+        assert!(message.contains("release"), "{message}");
+        // It must also hint at the packaging cause, which is the bug this whole
+        // change exists to prevent.
+        assert!(message.contains("installer"), "{message}");
+        // And it must have recorded probes, not just returned an empty failure.
+        assert!(failure.tried.len() >= 2, "expected several probed paths: {:#?}", failure.tried);
 
-        let _ = std::fs::remove_dir_all(&root);
+        cleanup(&root);
     }
 
     #[test]
     fn a_relative_or_absent_exe_never_panics() {
         // `current_exe()` can fail; the resolver must report, not panic.
-        assert!(resolve_repo_root_from(None).is_err());
+        assert!(resolve_sidecar_from(None, None).is_err());
+        assert!(resolve_sidecar_from(None, Some(PathBuf::from("nowhere"))).is_err());
     }
 
     #[test]

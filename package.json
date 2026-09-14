@@ -1,6 +1,6 @@
 {
   "name": "dsh-dock",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "DSH-Dock - a cross-platform desktop launcher for the official DeepSeek Harness (dsh).",
   "license": "MIT",
@@ -10,11 +10,12 @@
   ],
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "node scripts/stage-sidecar.mjs && vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
-    "sidecar": "node sidecar/index.js"
+    "sidecar": "node sidecar/index.js",
+    "stage:sidecar": "node scripts/stage-sidecar.mjs"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.0",
