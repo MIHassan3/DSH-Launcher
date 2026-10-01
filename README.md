@@ -109,7 +109,7 @@ The full version-management library, channel picker, and settings surface arrive
 
 1. **Download the installer.**
 
-   Go to the [latest release](https://github.com/MIHassan3/DSH-Launcher/releases/latest) and download **`DSH-Dock_0.5.0_x64-setup.exe`**.
+   Go to the [latest release](https://github.com/MIHassan3/DSH-Launcher/releases/latest) and download **`the latest version`**.
 
    > **Note:** The binary is unsigned, so Windows SmartScreen will warn you on first run. Click **More info** → **Run anyway**.
 
