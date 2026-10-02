@@ -155,3 +155,230 @@ The helpers are reusable — dot-source the script
 checks: `Test-Assertion`, `Remove-SafeDir`, `Invoke-SilentInstall`,
 `New-ProbeInstaller`, `Get-RegSnapshot`, `Restore-RegSnapshot`,
 `Get-JsonVersion`, `Get-CargoPackageVersion`, `Get-VersionFromInstallerName`.
+
+## Native menu bar
+
+`src-tauri/src/menu.rs` describes the whole menu as pure data:
+`menu_plan(state, target_os)` returns a `MenuPlan`, and `build_menu` turns that
+plan into a real `Menu`. Because native menus are immutable (section 2.7), any
+state change needs a fresh `Menu`; `rebuild_menu` does that, but only when the
+plan differs from the one currently on screen. Taking the target OS as an
+argument is what makes the macOS shape (application menu first) testable on
+Windows.
+
+### Diagnostics
+
+- **`DSH_DOCK_DUMP_MENU_PLAN=1`** — prints the plan for every scenario on every
+  platform as JSON to stdout and exits **before** Tauri starts: no window, no
+  sidecar, no data-directory access. Any value other than an empty string or `0`
+  turns it on. Stdout must be redirected or piped, because the release binary is
+  GUI-subsystem (`windows_subsystem = "windows"`). This is the artifact the menu
+  gate in `test/menu-check.ps1` asserts against.
+- **`DSH_DOCK_MENU_POLL_MS`** — status poll interval in milliseconds. Default
+  5000, floor 100. An unparseable value falls back to the default and a value
+  below the floor is clamped; either way a warning line is written to
+  `launcher.log` rather than the watcher failing to start.
+
+### What a rebuild writes to `launcher.log`
+
+```
+[shell] menu rebuild: reason=<initial|status-change|settings-change|poll> duration_ms=<N> status=<label> pid=<pid-or-none> version=<version-or-none>
+[shell] menu attached: harness=true main=true
+```
+
+The second line is the attach check. Tauri swallows platform attach errors, so
+"a menu was recorded for this window" is not the same as "the OS is showing it" —
+this line is what makes a silently menu-less window visible in the log.
+
+A poll that finds the same state logs **nothing**. The absence of rebuild lines
+is the evidence that the plan gate works: with the harness stopped, a 1s poll
+produced no rebuilds at all, because `unavailable` and `stopped` render the same
+`● Stopped` label.
+
+### Measured cost
+
+`reason=initial duration_ms=1` on the release build, `duration_ms=0` on the debug
+build. The field is truncated milliseconds, so `0` means "under 1 ms". At this
+menu size (~25 items) a rebuild is not a performance concern; the cost that
+matters is the platform's menu-bar repaint, which is why rebuilds are gated on a
+real content change and performed on the main thread (detach and attach then
+happen inside one event-loop message, so no paint can land between them).
+
+### The status-label fast path
+
+A full rebuild is a detach/attach of the menu bar per window, and it measured
+**~23 ms median (worst 44 ms) on a release build** against section 7.4's 5 ms
+target. A status transition changes one line of text and nothing else, so
+`rebuild_menu` handles that one case in place:
+
+1. build the would-be plan and compare it with the installed one;
+2. if the ONLY difference is the status line's text, look that item up by id
+   (`harness.status`) in the installed menu and call `set_text` on it;
+3. otherwise rebuild, exactly as before.
+
+muda's `set_text` writes the new string into every `HMENU` the item belongs to and
+calls `DrawMenuBar` for each window showing it
+(`platform_impl/windows/mod.rs`). So there is no `SetMenu` churn, no client-area
+resize, and no moment in which the menu bar is absent.
+
+The window is deliberately narrow. `status_only_change` normalises a copy of the
+candidate plan back to the installed status text and compares the two plans, so
+any other difference - a tick mark, an enabled flag, the version list, a
+different platform shape - declines the fast path and takes a full rebuild.
+Structural change therefore still has exactly one code path, and it cannot drift.
+
+It logs under a different name so the two cases can be measured apart:
+
+```
+[shell] menu update: reason=poll duration_ms=0 status=● Running · v0.1.5-rc.2 pid=4242 version=0.1.5-rc.2 (status label only, no rebuild)
+```
+
+**`Menu::get` is not a tree search.** It is
+`self.items().find(|i| i.id() == &id)` — direct children only — and this menu's
+direct children are the top-level submenus (Harness, Dock, Settings), so
+`harness.status` can never be found through it. `Submenu::get` behaves the same
+way. This cost one build cycle: the first fast path looked the item up with
+`Menu::get` and fell back to a full rebuild on every single tick. The lookup now
+walks submenus recursively, which also means it does not depend on where in the
+tree the item lives.
+
+When that lookup fails it says so and lists every id it can reach, so the next
+occurrence is answerable from the log alone:
+
+```
+[shell] menu update: 'harness.status' is not in the installed menu (ids present: harness, harness.restart, …); falling back to a full rebuild
+```
+
+### Menu actions belong to the dashboard, not to the shell
+
+A menu click never performs a harness action in Rust. `handle_menu_event` resolves
+the id, forwards the intent as a `menu:action` event carrying
+`{ "action": "start" | "stop" | "restart" | "refresh" | "open-logs" }` to the
+`main` window, and returns. `src/App.svelte` receives it and calls the very same
+function its own button calls. One implementation of each action, two entry
+points.
+
+Why this exists: the menu used to call the sidecar over HTTP by itself, so a menu
+"Stop Harness" stopped the harness while the dashboard went on showing it as
+running. Two implementations of "stop" had drifted apart.
+
+- Forwarded: `restart`, `stop`, `open-logs`. `start` and `refresh` are part of
+  the channel but no menu item emits them - section 3.8's menu has no Start (a
+  restart from stopped starts the harness) and no Refresh.
+- `open-logs` is forwarded AND performed in the shell: revealing a folder has no
+  dashboard state to keep in step, so a round trip would only add a failure mode.
+- The control panel is the action surface, but the app keeps running when `main`
+  is closed and the harness window is still open. An action that cannot be
+  delivered is therefore REPORTED, never swallowed:
+
+  ```
+  [shell] menu: could not deliver 'stop' - the control panel is not open
+  ```
+
+- What the shell still does itself: focusing the control panel
+  (`OpenControlPanel`), writing `settings.json` (the auto-update check items), and
+  the two placeholders (`Harness Update`, `Dock Update`) that log a notice and
+  bring the panel forward. Only the settings write and the logs opener need a
+  worker thread; everything else is an event emission or window management.
+
+## Shutting the sidecar down
+
+`stop_sidecar` logs its outcome (`the sidecar was terminated` / `could not
+terminate the sidecar` / `no child was recorded`), and the exit path logs
+`DSH-Dock exiting: stopping the sidecar`. Both exist because an orphaned sidecar
+is otherwise invisible: it keeps a loopback port open after the launcher is gone.
+Section 2.7 already documents orphaned `node.exe` processes and section 8.1
+defers Windows Job Objects to Phase 2, so an orphan after a **hard** kill is
+expected until then — these lines are what make the difference between "we never
+tried to stop it" and "the kill failed" readable.
+
+**Do not test a launcher's shutdown by closing its console window.** For a
+console-subsystem (debug) build, `CloseMainWindow()` and a console close target
+the console, and Windows terminates the whole process group with
+`STATUS_CONTROL_C_EXIT` (`0xC000013A`): no Tauri shutdown code runs at all, and
+the sidecar is left behind. Close the actual DSH-Dock window instead.
+
+## Windows and WebView2: the window that is created and then vanishes
+
+A Tauri window can be created, attached to a menu, and then destroyed a few
+hundred milliseconds later — leaving a process that is alive, responding, and
+has **no window at all**. `webview_windows()` still lists it, because the manager
+keeps the wrapper while the native handle is gone, so nothing in the launcher
+could previously tell "hidden" from "destroyed" from "never created".
+
+What the log says now:
+
+```
+[shell] window check [setup-start]: main=visible:error(runtime error: failed to receive message from webview)
+[shell] menu attached: main=menu:true visible:error(...)
+[shell] window probe [main]: hwnd=error(the underlying handle is not available) inner=error(...) visible=error(...)
+```
+
+`hwnd=error(the underlying handle is not available)` is
+`raw_window_handle::HandleError::Unavailable`: the native window does not exist.
+**The `[setup-start]` line is meaningful, not noise.** Tauri creates config
+windows - and their webviews - before the `setup` hook runs, so a healthy build
+reports `main=visible:true` there. A getter failure at that point means the
+webview was already broken before any of our own setup code ran. This is not the
+same as a getter failing because the loop is not pumping yet: when the webview
+exists, the answer comes back.
+
+**Root cause: WebView2 refuses to initialise at Low integrity.** Two ways to get
+there, one mechanism: the executable (or a folder above it) carries a
+`Mandatory Label\Low Mandatory Level` integrity label - on this repository it had
+been inherited into `src-tauri\target\debug\` from the tree itself - or the
+launching process token is Low, in which case children inherit it. A shell that
+runs its commands at Low integrity cannot host a Tauri window at all, whichever
+binary it launches, released ones included. That is exactly what was measured
+here: the shipped v0.5.1, a build of the pre-menu-bar sources and the current
+build all showed the window appearing and disappearing within ~200-500 ms, each
+with **zero `msedgewebview2.exe` processes**, because WebView2 never starts and
+wry tears the window down. Pointing `WEBVIEW2_USER_DATA_FOLDER` at a writable
+path changes nothing: the problem is integrity, not the profile path.
+
+A healthy run looks like this instead:
+
+```
+[shell] window check [setup-start]: main=visible:true
+[shell] menu attached: main=menu:true visible:true
+[shell] page load started [main]: http://tauri.localhost/
+[shell] page load finished [main]: http://tauri.localhost/
+[shell] window probe [main]: hwnd=1574662 inner=1650x1050 pos=124,1 visible=true minimized=false
+```
+
+### Diagnosis
+
+> If a fresh `target\debug` build renders no window AND `window probe [main]`
+> reports no handle AND the same binary works from a different path - check the
+> folder's integrity level with `icacls <path>`. A `Low Mandatory Level` label on
+> the repo tree blocks WebView2 initialization.
+> Fix: `icacls <path> /setintegritylevel "(OI)(CI)M" /T /C`.
+
+```powershell
+# 1. the executable's own label, and its folder's
+icacls "src-tauri\target\debug\dsh-dock.exe"
+icacls "src-tauri\target\debug"
+
+# 2. the integrity level of the process that launches it (children inherit it)
+whoami /groups | Select-String "Mandatory Label"
+```
+
+A `Low Mandatory Level` from either command is the answer. Both were seen in this
+repository's history: the folder carried the label, and the sandboxed shell that
+ran the tests was itself Low integrity.
+
+### Fix
+
+```powershell
+icacls "<repo>" /setintegritylevel "(OI)(CI)M" /T /C
+```
+
+Verified on this repository: ~49,000 files reset to Medium, no failures, and the
+window then reported `visible=true` and stayed up.
+
+### Rule
+
+If `window probe` reports no handle, the menu is not the suspect and neither is
+the Rust code - check the two integrity labels above. If it reports a real handle,
+a real size and `visible=true`, the window exists, and any remaining complaint is
+about menu content or clicks.

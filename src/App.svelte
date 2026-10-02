@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   // Plain JS on purpose: the retry policy is the part worth testing, and this
   // keeps it runnable under `node` with no browser and no test framework.
   import { CONNECT_PHASE, connectToSidecar } from "./lib/sidecar-connection.js";
@@ -230,9 +231,64 @@
     }
   }
 
+  /**
+   * Stop, then start.
+   *
+   * Deliberately the same two calls the buttons make, in the same order, rather
+   * than a separate restart route: the sidecar's own `/harness/restart` is
+   * literally `stop()` then `start()`, so this keeps ONE implementation of each
+   * half and inherits the state handling `stopHarness` and `startHarness` already
+   * do (closing the harness window, stopping the timers, resuming polling).
+   */
+  async function restartHarness() {
+    await stopHarness();
+    await startHarness();
+  }
+
+  /**
+   * The native menu's actions arrive here.
+   *
+   * THE POINT OF THIS LISTENER: the menu used to call the sidecar itself, so a
+   * menu "Stop Harness" stopped the harness while this window went on showing it
+   * as running. The menu now sends an intent and this function routes it to the
+   * very same handlers the buttons call, so there is one implementation of each
+   * action with two entry points.
+   */
+  function runMenuAction(action: string) {
+    switch (action) {
+      case "start":
+        void startHarness();
+        break;
+      case "stop":
+        void stopHarness();
+        break;
+      case "restart":
+        void restartHarness();
+        break;
+      case "refresh":
+        void refresh();
+        break;
+      case "open-logs":
+        // Nothing to do: the shell reveals the folder itself, because there is
+        // no dashboard state involved. The event is still sent so that every
+        // menu action travels the same channel.
+        break;
+      default:
+        // An unknown action means the shell and this file disagree; the shell
+        // logs clicks, so silence here is not the only trace.
+        break;
+    }
+  }
+
   onMount(() => {
     void initialRefresh();
-    return stopTimers;
+    const menuActions = listen<{ action?: string }>("menu:action", (event) => {
+      runMenuAction(event.payload?.action ?? "");
+    });
+    return () => {
+      stopTimers();
+      void menuActions.then((unlisten) => unlisten());
+    };
   });
 
   function formatStartedAt(value: string | null): string {

@@ -27,6 +27,9 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
+pub mod menu;
+pub mod settings;
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -56,12 +59,6 @@ const READY_PREFIX: &str = "SIDECAR_READY:";
 /// so this is generous for all three.
 const PROXY_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Environment variable that overrides the launcher data directory.
-///
-/// Mirrors `sidecar/lib/state.js`. The shell only needs it to know WHERE to
-/// write its own log; the sidecar remains the authority on launcher state.
-const DATA_DIR_ENV_VAR: &str = "DSH_DOCK_DATA_DIR";
-
 /// How the sidecar's stderr is wired up.
 ///
 /// MUST stay `Piped`. See [`spawn_sidecar`]: on a `windows_subsystem =
@@ -83,7 +80,7 @@ const SIDECAR_STDERR_INHERITED: bool = false;
 /// in `sidecar/lib/harness-start.js` for the harness; both were observed
 /// producing stray console windows.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// True when THIS process has a console attached.
 ///
@@ -111,55 +108,35 @@ static LAUNCHER_LOG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock:
 
 /// Resolves `<data-dir>/logs/launcher.log` for this platform.
 ///
-/// Deliberately a small mirror of the sidecar's rule rather than a second
-/// source of truth: the shell must be able to log a failure that happens
-/// BEFORE the sidecar exists, so it cannot ask the sidecar where to write.
+/// The data-directory rule itself lives in [`settings::data_dir`] - one rule in
+/// one place, shared by the settings file and this log, and mirroring
+/// `sidecar/lib/state.js` (section 2.4). The shell must be able to log a failure
+/// that happens BEFORE the sidecar exists, so it cannot ask the sidecar where to
+/// write; that is the only reason this path is resolved on this side at all.
 fn launcher_log_path() -> Option<PathBuf> {
-    let root = match std::env::var(DATA_DIR_ENV_VAR) {
-        Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
-        _ => {
-            #[cfg(windows)]
-            {
-                let base = std::env::var("LOCALAPPDATA")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        std::env::var("USERPROFILE")
-                            .ok()
-                            .map(|home| PathBuf::from(home).join("AppData").join("Local"))
-                    })?;
-                base.join("DSH-Dock")
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let home = std::env::var("HOME").ok()?;
-                PathBuf::from(home)
-                    .join("Library")
-                    .join("Application Support")
-                    .join("DSH-Dock")
-            }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            {
-                let base = std::env::var("XDG_DATA_HOME")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .map(PathBuf::from)
-                    .or_else(|| std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(".local").join("share")))?;
-                base.join("dsh-dock")
-            }
-        }
-    };
-    Some(root.join("logs").join("launcher.log"))
+    Some(settings::data_dir()?.join("logs").join("launcher.log"))
 }
 
 /// Initializes the launcher log. Idempotent; safe to call more than once.
 fn init_launcher_log() {
     LAUNCHER_LOG.get_or_init(|| {
         let path = launcher_log_path()?;
+
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok()?;
+            // A failure here used to be swallowed, which silently disabled ALL
+            // file logging: the launcher looked like it was running while
+            // nothing was written anywhere. It is reported now, with the path,
+            // because "there is no log file" must never read as "there were no
+            // problems".
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                eprintln!(
+                    "[shell] could not create the log directory {}: {error}",
+                    parent.display()
+                );
+                return None;
+            }
         }
+
         Some(path)
     });
 }
@@ -174,7 +151,7 @@ fn init_launcher_log() {
 ///
 /// Never panics and never fails a caller: diagnostics must not be able to break
 /// startup. A logging failure is itself written to stderr and otherwise ignored.
-fn log_line(message: &str) {
+pub(crate) fn log_line(message: &str) {
     let stamped = format!("{} [shell] {message}", timestamp());
 
     // stderr still helps in dev (`cargo tauri dev` attaches a console).
@@ -186,10 +163,25 @@ fn log_line(message: &str) {
     match std::fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut file) => {
             use std::io::Write;
-            let _ = writeln!(file, "{stamped}");
+            // ONE `write_all`, deliberately not `writeln!`.
+            //
+            // Several threads log concurrently: the sidecar's stdout and stderr
+            // readers, the diagnostic watchers, menu-click workers and the main
+            // thread. `write_fmt` issues one write per formatted piece, which in
+            // a real run interleaved two threads mid-line - a handshake line lost
+            // its newline and ran into the next thread's line. Appending a single
+            // small buffer is atomic on both platforms.
+            let line = format!("{stamped}\n");
+            let _ = file.write_all(line.as_bytes());
         }
         Err(error) => {
-            eprintln!("[shell] could not write the launcher log: {error}");
+            // The PATH is part of the message: "Access is denied" is only
+            // actionable once you know which file was refused, and this is the
+            // one failure that leaves the launcher with no log at all.
+            eprintln!(
+                "[shell] could not write the launcher log at {}: {error}",
+                path.display()
+            );
         }
     }
 }
@@ -332,8 +324,17 @@ impl SidecarState {
     pub fn stop_sidecar(&self) {
         let mut slot = self.child.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(mut child) = slot.take() {
-            let _ = child.kill();
+            // Logged because an orphaned sidecar is invisible otherwise: it holds
+            // a loopback port and keeps running after the launcher is gone, and
+            // the only way to tell "we never tried" from "the kill failed" is to
+            // say so here.
+            match child.kill() {
+                Ok(()) => log_line("sidecar stop: the sidecar was terminated"),
+                Err(error) => log_line(&format!("sidecar stop: could not terminate the sidecar: {error}")),
+            }
             let _ = child.wait();
+        } else {
+            log_line("sidecar stop: no child was recorded (already stopped?)");
         }
     }
 
@@ -415,7 +416,7 @@ fn sidecar_port(state: tauri::State<'_, SidecarState>) -> Result<u16, String> {
 ///
 /// The shell does NOT interpret the body. `status`, `starting`, `error` and the
 /// log tails are the sidecar's business; the UI renders them.
-fn proxy_control(
+pub(crate) fn proxy_control(
     state: &tauri::State<'_, SidecarState>,
     method: &str,
     path: &str,
@@ -477,8 +478,25 @@ fn proxy_control(
 
 /// Proxy for `GET /harness/status` (see `sidecar/lib/control.js`).
 #[tauri::command]
-fn harness_status(state: tauri::State<'_, SidecarState>) -> ProxiedResponse {
-    proxy_control(&state, "GET", "/harness/status")
+fn harness_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SidecarState>,
+) -> ProxiedResponse {
+    let response = proxy_control(&state, "GET", "/harness/status");
+
+    // Opportunistic menu refresh: the caller has just asked for the status, so
+    // the menu should reflect it immediately instead of waiting for the watcher's
+    // next tick. This runs on the main thread (a synchronous command does) and
+    // `rebuild_menu` is main-thread-safe, but the rebuild gate reduces it to a
+    // plan comparison whenever nothing the menu renders has actually moved.
+    if let Some(runtime) = app.try_state::<menu::MenuRuntime>() {
+        let snapshot = menu::snapshot_from_response(&response);
+        if runtime.update_harness(&snapshot) {
+            menu::rebuild_menu(&app, menu::RebuildReason::StatusChange);
+        }
+    }
+
+    response
 }
 
 /// Proxy for `POST /harness/start`.
@@ -521,7 +539,11 @@ fn harness_window_open(app: &tauri::AppHandle) -> bool {
 }
 
 /// Closes the `harness` window if it exists. Returns true when one was closed.
-fn close_harness_window_inner(app: &tauri::AppHandle) -> bool {
+///
+/// Generic over the runtime and `pub(crate)` so the menu's Stop action can reuse
+/// it: stopping the harness from the menu must leave the same state behind as
+/// stopping it from the dashboard.
+pub(crate) fn close_harness_window_inner<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
     match app.get_webview_window(HARNESS_WINDOW_LABEL) {
         Some(window) => {
             let _ = window.close();
@@ -667,6 +689,53 @@ fn spawn_auto_open_watcher(app: tauri::AppHandle) {
             }
         }
         log_line("auto-open: gave up waiting for a running harness");
+    });
+}
+
+/// Polls the harness status so the menu's status label stays current.
+///
+/// WHY A POLL AT ALL: nothing pushes status. The dashboard polls
+/// `harness_status` while a start is in flight, but the menu must also be correct
+/// when the dashboard is closed and only the harness window is open. The poll is
+/// the safety net; `harness_status` refreshes the menu opportunistically whenever
+/// a caller asks for the status anyway.
+///
+/// THREADING: this runs on its own thread and never blocks the main thread. It
+/// performs one loopback HTTP call, updates the shared state, and asks for a
+/// rebuild - which the plan gate drops unless something the menu renders moved.
+/// The loop is SERIAL (sleep, call, repeat), so a slow or wedged sidecar degrades
+/// the cadence instead of stacking requests.
+///
+/// Interval: 5s by default, overridable with `DSH_DOCK_MENU_POLL_MS` for manual
+/// testing. An unparseable or absurd value falls back or clamps rather than
+/// stopping the watcher (see `menu::poll_interval_from`).
+fn spawn_menu_status_watcher(app: tauri::AppHandle) {
+    let (interval, warning) =
+        menu::poll_interval_from(std::env::var(menu::POLL_INTERVAL_ENV_VAR).ok().as_deref());
+
+    if let Some(warning) = warning {
+        log_line(&format!("menu: {warning}"));
+    }
+    log_line(&format!(
+        "menu: status watcher polling every {}ms (override with {})",
+        interval.as_millis(),
+        menu::POLL_INTERVAL_ENV_VAR
+    ));
+
+    thread::spawn(move || loop {
+        thread::sleep(interval);
+
+        // Blocking, off the main thread, by design.
+        let snapshot = menu::current_harness_snapshot(&app);
+
+        let changed = match app.try_state::<menu::MenuRuntime>() {
+            Some(runtime) => runtime.update_harness(&snapshot),
+            None => false,
+        };
+
+        if changed {
+            menu::request_rebuild(&app, menu::RebuildReason::Poll);
+        }
     });
 }
 
@@ -1279,6 +1348,145 @@ fn spawn_sidecar(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Logs whether every window is currently VISIBLE, according to the OS.
+///
+/// DIAGNOSTIC, and a permanent one: `is_visible()` asks Windows
+/// (`IsWindowVisible`), it does not report what this process believes. The
+/// launcher once shipped a window that Tauri had created and considered fine
+/// while the OS showed nothing, and there was no line in the log that could have
+/// said so. One line per startup stage costs nothing and answers "which step made
+/// the window disappear".
+fn log_window_visibility(app: &tauri::AppHandle, stage: &str) {
+    let mut parts: Vec<String> = app
+        .webview_windows()
+        .iter()
+        .map(|(label, window)| {
+            let state = match window.is_visible() {
+                Ok(visible) => visible.to_string(),
+                Err(error) => format!("error({error})"),
+            };
+            format!("{label}=visible:{state}")
+        })
+        .collect();
+    parts.sort();
+
+    let described = if parts.is_empty() {
+        "no windows".to_owned()
+    } else {
+        parts.join(" ")
+    };
+    log_line(&format!("window check [{stage}]: {described}"));
+}
+
+/// How long after startup the native window state is checked.
+const WINDOW_PROBE_DELAY: Duration = Duration::from_secs(3);
+
+/// One post-startup check of every window's NATIVE state.
+///
+/// WHY THIS EXISTS. A Tauri window can be created, attached to a menu, and then
+/// disappear - and `webview_windows()` still lists it, because the manager keeps
+/// the wrapper while the native handle is gone. Nothing in the launcher could
+/// tell the difference between "hidden", "destroyed" and "never created", which
+/// turned one investigation into guesswork. Three seconds after startup this
+/// asks the OS directly and records the handle, the size, the position and the
+/// visibility of every window, so the answer is one log line.
+///
+/// The failure it is designed to catch looks like this:
+///
+/// ```text
+/// window probe [main]: hwnd=error(the underlying handle is not available) \
+///     inner=error(...) visible=error(...)
+/// ```
+///
+/// That means the native window does not exist. In a confined shell it happens
+/// to EVERY Tauri binary on the machine, including a released one: WebView2
+/// never spawns a child process, the window is destroyed a few hundred
+/// milliseconds after it appears, and the process stays alive with no windows.
+/// Run the app from a normal desktop shell if you see this.
+///
+/// Getters fail during `setup` (nothing is pumping the loop yet), which is why
+/// this runs on its own thread after the loop is live. It never panics and never
+/// blocks anything: diagnostics must not be able to break startup.
+fn spawn_window_probe(app: tauri::AppHandle) {
+    thread::spawn(move || {
+        thread::sleep(WINDOW_PROBE_DELAY);
+
+        log_line("window probe: checking the native window state");
+
+        // "The manager lost the window" and "the native window is gone" look
+        // identical from outside and have different causes, so they are reported
+        // separately.
+        if app.get_webview_window(MAIN_WINDOW_LABEL).is_none() {
+            log_line("window probe: 'main' is GONE from the window manager");
+        }
+
+        let windows = app.webview_windows();
+        if windows.is_empty() {
+            log_line("window probe: the window manager holds NO windows");
+        }
+
+        for (label, window) in windows {
+            #[cfg(windows)]
+            let hwnd = window
+                .hwnd()
+                // The handle is a raw pointer; the decimal value is what a human
+                // can match against `netstat`/Spy++ output.
+                .map(|handle| (handle.0 as isize).to_string())
+                .unwrap_or_else(|error| format!("error({error})"));
+            #[cfg(not(windows))]
+            let hwnd = "n/a".to_owned();
+
+            // Each getter is described independently: a single failing getter
+            // says which part of the window is missing, and they do not all fail
+            // together.
+            let describe = |result: tauri::Result<String>| {
+                result.unwrap_or_else(|error| format!("error({error})"))
+            };
+
+            let size = describe(
+                window
+                    .inner_size()
+                    .map(|size| format!("{}x{}", size.width, size.height)),
+            );
+            let position = describe(
+                window
+                    .outer_position()
+                    .map(|position| format!("{},{}", position.x, position.y)),
+            );
+            let visible = describe(window.is_visible().map(|visible| visible.to_string()));
+            let minimized = describe(window.is_minimized().map(|minimized| minimized.to_string()));
+
+            log_line(&format!(
+                "window probe [{label}]: hwnd={hwnd} inner={size} pos={position} \
+                 visible={visible} minimized={minimized}"
+            ));
+        }
+    });
+}
+
+/// Environment variable that dumps the menu plan as JSON and exits.
+///
+/// DIAGNOSTIC ONLY, and deliberately not gated on a debug build: it has to work
+/// on the RELEASE binary, because that is what `src-tauri/test/menu-check.ps1`
+/// asserts against (section 7.4: acceptance runs the release binary with no dev
+/// server).
+///
+/// Any value other than an empty string or `0` turns it on. Output goes to
+/// stdout, so it must be redirected or piped to be visible from a
+/// `windows_subsystem = "windows"` binary.
+const DUMP_MENU_PLAN_ENV_VAR: &str = "DSH_DOCK_DUMP_MENU_PLAN";
+
+/// True when [`DUMP_MENU_PLAN_ENV_VAR`] asks for the dump.
+fn dump_menu_plan_requested() -> bool {
+    match std::env::var(DUMP_MENU_PLAN_ENV_VAR) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            !trimmed.is_empty() && trimmed != "0"
+        }
+        Err(_) => false,
+    }
+}
+
 /// Builds and runs the Tauri application.
 ///
 /// TODO(Phase 3/4): `cargo tauri dev` is a real footgun here. If port 1420 is
@@ -1291,8 +1499,26 @@ fn spawn_sidecar(app: &tauri::AppHandle) -> Result<(), String> {
 /// spawned by this process.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // DIAGNOSTIC SHORT-CIRCUIT, before anything Tauri exists.
+    //
+    // Returning here means no window is created, no sidecar is spawned, no
+    // launcher log is opened and no data directory is touched - the menu plan is
+    // pure data, so the dump must not have side effects of its own. `writeln!`
+    // rather than `println!` because a write failure must not panic a
+    // GUI-subsystem process whose stdout is not attached to anything.
+    if dump_menu_plan_requested() {
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), "{}", menu::dump_json());
+        return;
+    }
+
     tauri::Builder::default()
         .manage(SidecarState::default())
+        // Read once, here, before any window exists: the settings file is the
+        // single source of truth (section 3.11, Q53) and everything that follows
+        // - the menu bar, the first-run gate, the future settings window - reads
+        // this one in-memory copy.
+        .manage(settings::SettingsState::load())
         .invoke_handler(tauri::generate_handler![
             sidecar_port,
             harness_status,
@@ -1301,6 +1527,24 @@ pub fn run() {
             open_harness_window,
             close_harness_window
         ])
+        // Every webview page load, named. The harness window logs its own (with
+        // navigation diagnostics); this covers the CONFIG window, whose URL says
+        // which mode the build is in - an embedded-asset URL
+        // (`tauri://localhost/...`, `http://tauri.localhost/...`) or a dev server
+        // (`http://127.0.0.1:1420`). A window that never logs a page load never
+        // got a webview at all, which is a different fault from a page that
+        // failed to render.
+        .on_page_load(|webview, payload| {
+            let event = match payload.event() {
+                tauri::webview::PageLoadEvent::Started => "started",
+                tauri::webview::PageLoadEvent::Finished => "finished",
+            };
+            log_line(&format!(
+                "page load {event} [{}]: {}",
+                webview.label(),
+                payload.url()
+            ));
+        })
         .setup(|app| {
             // The launcher log must exist BEFORE anything can fail, because on a
             // Windows release build it is the only place a failure is visible.
@@ -1311,6 +1555,49 @@ pub fn run() {
                 if cfg!(debug_assertions) { "debug" } else { "release" },
                 if has_console() { "attached" } else { "none" }
             ));
+            log_window_visibility(app.handle(), "setup-start");
+
+            // Settings were read during `manage(...)`, i.e. BEFORE the launcher log
+            // existed, so their warnings surface here - once, and immediately
+            // after the log is usable. The line also records which file is in
+            // force and which channel is tracked, which is the first thing a
+            // menu-behaviour report needs to know.
+            {
+                let settings = app.state::<settings::SettingsState>();
+                for warning in settings.warnings() {
+                    log_line(&format!("settings: WARNING - {warning}"));
+                }
+                log_line(&format!(
+                    "settings: channel={} first_run_completed={} file={}",
+                    settings.auto_update_channel(),
+                    settings.first_run_completed(),
+                    settings
+                        .path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "(unresolved: no data directory)".to_owned())
+                ));
+            }
+
+            // The menu bar is the durable surface (section 2.9), so it is attached
+            // BEFORE anything else can fail: a launcher whose sidecar died still
+            // has a usable menu. Section 2.7's "menus are immutable" rule is
+            // handled inside `rebuild_menu`, which rebuilds only when the plan
+            // actually differs from what is on screen.
+            //
+            // Called from `setup`, i.e. already on the main thread, so every one
+            // of its internal main-thread hops runs inline.
+            let menu_state = {
+                let settings = app.state::<settings::SettingsState>().snapshot();
+                menu::MenuState::from_settings(&settings)
+            };
+            app.manage(menu::MenuRuntime::new(menu_state));
+            log_window_visibility(app.handle(), "after-manage");
+            // Registered before the first rebuild, so no window can be shown with
+            // a menu whose clicks would go nowhere.
+            app.on_menu_event(menu::handle_menu_event);
+            log_window_visibility(app.handle(), "before-initial-rebuild");
+            menu::rebuild_menu(app.handle(), menu::RebuildReason::Initial);
+            log_window_visibility(app.handle(), "after-initial-rebuild");
 
             // A failed spawn must not abort startup: the window still needs to
             // open so the failure is visible to the user rather than silent.
@@ -1320,13 +1607,26 @@ pub fn run() {
                 state.set_error(message.clone());
                 let _ = app.handle().emit(EVENT_SIDECAR_ERROR, message);
             }
+            log_window_visibility(app.handle(), "after-sidecar-spawn");
 
             // Off unless DSH_DOCK_AUTO_OPEN_HARNESS=1; see the note there.
             spawn_auto_open_watcher(app.handle().clone());
 
+            // Keeps the menu's status label current even with the dashboard
+            // closed; see the note on the watcher.
+            spawn_menu_status_watcher(app.handle().clone());
+            log_window_visibility(app.handle(), "setup-end");
+            spawn_window_probe(app.handle().clone());
+
             Ok(())
         })
         .on_window_event(|window, event| {
+            // Every close request is logged. A window that disappears without
+            // this line was not closed by us and not closed by a click, which is
+            // the difference between "we hid it" and "something else did".
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                log_line(&format!("window event: {} CloseRequested", window.label()));
+            }
             // NOTE (Phase 1): this handler must NEVER touch the harness.
             //
             // The harness is spawned detached by the sidecar and is designed to
@@ -1353,6 +1653,7 @@ pub fn run() {
             // Belt and braces: on a normal exit, make sure the sidecar is gone.
             // The harness is deliberately NOT touched - see the note above.
             if let tauri::RunEvent::Exit = event {
+                log_line("DSH-Dock exiting: stopping the sidecar");
                 app.state::<SidecarState>().stop_sidecar();
             }
         });
@@ -1699,17 +2000,20 @@ mod tests {
 
     #[test]
     fn the_launcher_log_path_is_under_the_data_dir() {
-        // Mirrors the sidecar's rule; a failure before the sidecar exists still
-        // has somewhere to be written.
-        let previous = std::env::var(DATA_DIR_ENV_VAR).ok();
-        std::env::set_var(DATA_DIR_ENV_VAR, std::env::temp_dir().join("dsh-dock-log-test"));
+        // The rule now lives in `settings::data_dir` (mirroring the sidecar's);
+        // a failure before the sidecar exists still has somewhere to be written.
+        let previous = std::env::var(settings::DATA_DIR_ENV_VAR).ok();
+        std::env::set_var(
+            settings::DATA_DIR_ENV_VAR,
+            std::env::temp_dir().join("dsh-dock-log-test"),
+        );
 
         let path = launcher_log_path().expect("a data dir is resolvable");
         assert!(path.ends_with("logs/launcher.log") || path.ends_with("logs\\launcher.log"), "{path:?}");
 
         match previous {
-            Some(value) => std::env::set_var(DATA_DIR_ENV_VAR, value),
-            None => std::env::remove_var(DATA_DIR_ENV_VAR),
+            Some(value) => std::env::set_var(settings::DATA_DIR_ENV_VAR, value),
+            None => std::env::remove_var(settings::DATA_DIR_ENV_VAR),
         }
     }
 
@@ -1740,6 +2044,12 @@ mod tests {
     }
 
     #[test]
+    // `SIDECAR_STDERR_INHERITED` is a constant, and comparing it to a constant is
+    // the entire point: this assertion is what stops a future edit from quietly
+    // writing `Stdio::inherit()` back into `spawn_sidecar`, which reintroduced a
+    // visible console window in release builds. A "more meaningful" runtime
+    // comparison would lose exactly the property being guarded.
+    #[allow(clippy::assertions_on_constants)]
     fn the_sidecar_stderr_is_never_inherited() {
         // Regression test for the visible-console bug.
         //

@@ -1,8 +1,8 @@
 # DSH-Dock: A Unified Framework for a Professional DeepSeek Harness Launcher
 
-**Document Version:** 2.4.0
+**Document Version:** 2.5.0
 **Last Updated:** 2026-10-02
-**Status:** Menu bar design approved — ready to build
+**Status:** Pause 3 + 3.5 complete — Pause 4 ready to begin
 
 ---
 
@@ -57,8 +57,6 @@ We **bundle a portable Node.js runtime (v22.19+ LTS)** with the app, one binary 
 
 **Consequence for the sidecar:** we do not compile our Node.js core into a standalone binary. Since we ship a Node runtime, our sidecar is a **plain `.js` file executed by the bundled Node**. `pkg` and Node SEA are not used.
 
-The sidecar runs as: `bundled-node(.exe) <path>/sidecar/index.js`
-
 During Phase 1 (development), the sidecar runs on **system Node** — the bundled runtime is a Phase 4 packaging step.
 
 ### 2.2. Three Load-Bearing Architectural Decisions
@@ -72,7 +70,7 @@ The harness prints its listening URL (`dsh web: http://127.0.0.1:<port>/?token=.
 The harness is started with `detached: true` + `unref()` so it survives the launcher UI closing. **Verified end-to-end**: closing the launcher leaves the harness serving; the next launch adopts it in milliseconds.
 
 **System Tray Integration.**
-Deferred until **after Phase 2/3**. The tray is an enhancement, not a primary surface — Linux support is fragmented (GNOME 40+ has no tray by default) and cannot be relied on. The native menu bar (§2.8) is the primary in-app surface. See §2.9 for the full cross-platform strategy.
+Deferred until **after Phase 2/3**. The tray is an enhancement, not a primary surface — Linux support is fragmented (GNOME 40+ has no tray by default). The native menu bar (§2.8) is the primary in-app surface.
 
 ### 2.3. Detecting and Adopting a Running Harness
 
@@ -136,7 +134,7 @@ The harness window:
 - Accepts only `http://127.0.0.1:<port>/...` URLs. `localhost` and IPv6 loopback are rejected (see §2.7).
 - Grants **no** Tauri commands.
 
-### 2.7. Development Environment Constraints (Discoveries from Phases 0, 1, and v0.5.1)
+### 2.7. Development Environment Constraints (Discoveries from Phases 0, 1, and the Menu Bar Build)
 
 These are non-obvious behaviors discovered during development. They must be respected throughout the project.
 
@@ -156,7 +154,7 @@ custom-protocol = ["tauri/custom-protocol"]
 default = ["custom-protocol"]
 ```
 
-Without it, release binaries load from `devUrl` at runtime and fail with `ERR_CONNECTION_REFUSED`. **The `default = ["custom-protocol"]` line is load-bearing** — a `[features]` table without a default list leaves the feature off.
+Without it, release binaries load from `devUrl` at runtime and fail with `ERR_CONNECTION_REFUSED`.
 
 **Console window prevention.** A GUI-subsystem binary on Windows spawns console-subsystem children with a fresh console window unless `CREATE_NO_WINDOW` (`0x08000000`) is passed via `CommandExt::creation_flags`. This applies to **both** the Rust-side spawn of the sidecar and the sidecar's own spawn of the harness.
 
@@ -164,23 +162,27 @@ Without it, release binaries load from `devUrl` at runtime and fail with `ERR_CO
 
 **Harness log truncation during boot.** The harness rewrites `harness-<id>.log` itself during startup. Launcher diagnostics go in `harness-<id>.launcher.log`.
 
-**NSIS custom templates are Handlebars-processed.** A custom `installer.nsi` referenced by `bundle.windows.nsis.template` is processed by Handlebars *before* NSIS sees it. Any literal double-brace sequence (`{{`) anywhere in the file — **including inside a comment** — will fail the bundler with a handlebars-syntax panic. The `src-tauri/nsis/installer.nsi` header documents this.
+**NSIS custom templates are Handlebars-processed.** A custom `installer.nsi` referenced by `bundle.windows.nsis.template` is processed by Handlebars *before* NSIS sees it. Any literal double-brace sequence (`{{`) anywhere in the file — **including inside a comment** — will fail the bundler with a handlebars-syntax panic.
 
-**NSIS install location and data location must differ.** The NSIS `currentUser` default is `$LOCALAPPDATA\${PRODUCTNAME}`, which collides with our data directory `%LOCALAPPDATA%\DSH-Dock\` if unmodified. The custom template changes this to `$LOCALAPPDATA\Programs\${PRODUCTNAME}`. See §2.4.
+**NSIS install location and data location must differ.** The NSIS `currentUser` default is `$LOCALAPPDATA\${PRODUCTNAME}`, which collides with our data directory `%LOCALAPPDATA%\DSH-Dock\` if unmodified.
 
-**Registry key `HKCU\Software\dshdock\DSH-Dock`.** The stock NSIS template reads this on install to restore a previous install location. We disable the restore call in our custom template — a stale key from a prior version would otherwise override the new default and reintroduce the collision.
+**Registry key `HKCU\Software\dshdock\DSH-Dock`.** The stock NSIS template reads this on install to restore a previous install location. We disable the restore call in our custom template.
 
-**Hash reproducibility caveat.** Consecutive builds of identical source do **not** produce identical bytes on Windows because the PE `TimeDateStamp` changes per link. The release process hashes the *artifact that ships*, not "the build". Users verifying a release should verify the artifact itself, not rebuild and compare.
+**Hash reproducibility caveat.** Consecutive builds of identical source do **not** produce identical bytes on Windows. The release process hashes the *artifact that ships*.
 
-**Silent NSIS installs skip the Start menu shortcut.** The `/S` flag runs the installer non-interactively, and the shortcut-creation step is gated behind the wizard flow. Interactive installs create the shortcut normally. This is expected behavior; the acceptance tests account for it.
+**Silent NSIS installs skip the Start menu shortcut.** Expected behavior; interactive installs create the shortcut normally.
 
-**Native menus cannot be partially modified.** Tauri's `MenuBuilder` produces an immutable menu. Any state change (status text, checkbox state, version list) requires rebuilding the entire menu and calling `set_menu()` again. The menu builder function must read from a shared `MenuState` struct and construct a fresh menu on each rebuild.
+**Native menus cannot be partially modified via the builder API.** Tauri's `MenuBuilder` produces an immutable menu. Any structural state change requires rebuilding the entire menu and calling `set_menu()` again. However, **individual `MenuItem` handles support in-place `set_text` / `set_enabled` / `set_checked`** via muda — see §2.8.4.
+
+**`Menu::get` searches direct children only.** `Menu::get(id)` in tauri 2.11.5 (`menu/menu.rs:363`) does `self.items()...find(|i| i.id() == &id)` — **direct children only**. An item nested inside a submenu (like `harness.status` inside the Harness submenu) cannot be found from the root menu. `Submenu::get` has identical semantics. A recursive walk is required to find deeply nested items by id.
+
+**Low integrity labels block WebView2.** A `Low Mandatory Level` integrity label on the repo tree — inherited from a parent or applied by a sandbox tool — makes WebView2 refuse to initialize. Symptom: the window is created, painted briefly, then destroyed with no error; `window probe` reports no handle. Fix: `icacls <path> /setintegritylevel "(OI)(CI)M" /T /C`. A Low-integrity launching shell has the same effect on child processes. Check `icacls <path> | Select-String "Mandatory Label"` and `whoami /groups | Select-String "Mandatory Label"` before suspecting code.
 
 ### 2.8. Menu Bar Architecture
 
 The primary in-app surface for quick actions and status is a **native menu bar** built with Tauri's built-in menu API. This is the only surface that works identically across Windows, macOS, and Linux without custom code.
 
-**Cross-platform behavior:**
+#### 2.8.1. Cross-Platform Behavior
 
 | Platform | Where the menu appears |
 | :--- | :--- |
@@ -188,42 +190,75 @@ The primary in-app surface for quick actions and status is a **native menu bar**
 | macOS | Global menu bar at the top of the screen |
 | Linux | Window frame menu bar |
 
-Tauri handles the platform-specific placement automatically when the menu is attached to a window.
+Tauri handles the platform-specific placement automatically when the menu is attached to a window. The **menu tree shape differs per platform** (§2.8.2), but the actions and their handlers are identical.
 
-**What is used:**
-- `MenuBuilder` / `SubmenuBuilder` for structure
-- `MenuItemBuilder` for clickable items
-- `CheckMenuItemBuilder` for toggles
-- `PredefinedMenuItem` for OS-native items (About, Quit, Minimize, etc.)
-- `set_menu()` to rebuild the menu on state change
+#### 2.8.2. Platform Shape
 
-**What is NOT used:**
-- **Custom titlebar** (`decorations: false`) — rejected. Too much work, Linux support is best-effort, loses native window features on macOS.
-- **Tray menu as primary surface** — deferred. GNOME/Linux support gaps make it unreliable as the only anchor.
-- **DOM injection into the harness page** — rejected. Philosophically uncomfortable even though harmless.
+**Windows / Linux:**
+```
+Harness ▸
+Dock ▸
+  About DSH-Dock
+Settings ▸
+```
 
-**Menu events:** Menu items emit Tauri events (`window.emit()`) to notify the frontend of actions. The frontend listens and responds accordingly.
+**macOS:** the first submenu becomes the application menu. Our shape:
+```
+DSH-Dock (app menu) ▸
+  About DSH-Dock
+  ─────
+  Settings…
+  ─────
+  Hide DSH-Dock / Hide Others / Show All
+  ─────
+  Quit DSH-Dock
+Harness ▸
+Dock ▸
+  (no About here — it lives in the app menu)
+```
 
-**What the menu can't do:** Native menus don't support text inputs, sliders, dropdown selectors, or custom UI. Complex settings must live in the control panel window. The menu is for quick actions and simple toggles.
+**Rule:** About appears exactly once per platform. Settings appears as a top-level menu on Windows/Linux, and inside the app menu on macOS. The Harness submenu is byte-identical across all three platforms.
+
+#### 2.8.3. Attach and Rebuild
+
+- `AppHandle::set_menu()` is app-wide. It assigns the menu to every existing window that has none, and windows created later inherit it at creation.
+- Replacing the menu cleans the previous entry out of the menu stash — no unbounded growth.
+- The menu is **immutable** at the Tauri builder level. Any structural change requires rebuilding and calling `set_menu` again.
+- **Handlers must not block.** `on_menu_event` runs on the main thread; any I/O must move to a worker thread, and any UI work must marshal back via `run_on_main_thread`.
+- **Rebuild vs update:** see §2.8.4.
+
+#### 2.8.4. Rebuild vs Update — The Fast Path
+
+Two menu-change mechanisms exist:
+
+- **Full rebuild** — construct a fresh `Menu` from the current plan and call `set_menu`. Cost: ~37 ms on Windows (measured, release build). Used for **any structural change**: a checkbox toggles, the recent-versions list changes, the platform shape differs.
+- **Status-label fast path** — an in-place `MenuItem::set_text` on the status label only. Cost: **0 ms measured**. Used when the *only* difference between the current plan and the last-installed plan is the status label's text.
+
+The fast path's guard is a full plan comparison (`status_only_change`). It declines automatically on **any difference other than the status text**, including fields that don't exist yet — so when Phase 2 adds `recent_versions` updates, the fast path will route them to a full rebuild without any code change.
+
+The status item is located by **recursive id walk** (`installed_item`), not by `Menu::get`, because the latter searches direct children only (§2.7). If the walk fails, the log names the id it wanted and every id present, and falls through to a full rebuild — never silently no-ops.
+
+**Performance targets:**
+- Steady-state status-label updates: **< 5 ms** (currently 0 ms).
+- Structural rebuilds: informational; ~37 ms on Windows release is acceptable because they are rare and user-initiated.
+
+#### 2.8.5. What the Menu Does Not Do
+
+Native menus don't support text inputs, sliders, or dropdown selectors. Complex settings live in the control panel window.
 
 ### 2.9. Cross-Platform Surface Strategy
 
-Not every surface works everywhere. The design assumes the most limited case.
-
-| Surface | Windows | macOS | Linux (KDE/XFCE/Cinnamon) | Linux (stock GNOME 40+) |
+| Surface | Windows | macOS | Linux (KDE/XFCE) | Linux (stock GNOME 40+) |
 | :--- | :--- | :--- | :--- | :--- |
 | **Native menu bar** | ✅ | ✅ | ✅ | ✅ |
 | Application menu entry | ✅ | ✅ | ✅ | ✅ |
 | System tray icon | ✅ | ✅ | ✅ | ❌ (needs extension) |
 | Tray left-click events | ✅ | ✅ | ❌ | ❌ |
 | System notifications | ✅ | ✅ | ✅ | ✅ (daemon-dependent) |
-| Notification action buttons | ✅ | ✅ | ⚠️ | ⚠️ |
 
-**The durable anchors (always work):** the native menu bar and the application menu entry (Start menu on Windows, Applications on macOS, app launcher on Linux).
+**The durable anchors:** the native menu bar and the application menu entry.
 
-**The enhancements (work where supported):** tray icon, tray menu, notification action buttons.
-
-**Design consequence:** the first-run experience and the settings window must be reachable without the tray. Every action that matters has a path that doesn't depend on tray support.
+**Design consequence:** the first-run experience and the settings window must be reachable without the tray.
 
 ---
 
@@ -231,54 +266,52 @@ Not every surface works everywhere. The design assumes the most limited case.
 
 ### 3.1. Version Management Library — the heart of the product
 
-**Real npm dist-tags (verified 2026-09-10):**
+**Real npm dist-tags (verified 2026-10-02):**
 
 | Channel | npm dist-tag | Current value | Notes |
 | :--- | :--- | :--- | :--- |
-| **Stable** | `latest` | `0.1.5-rc.1` | Default. Until the harness reaches 1.0, `latest` itself points at an RC. |
-| **RC** | `next` | `0.1.5-rc.2` | Release candidate. Genuinely newest pre-release. |
-| **Alpha** | `alpha` | `0.1.5-alpha.2` | Bleeding edge. Changes often. |
+| **Stable** | `latest` | `0.2.0-rc.2` | Default. Until the harness reaches 1.0, `latest` itself points at an RC. |
+| **RC** | `next` | `0.2.0-rc.2` | Release candidate. Genuinely newest pre-release. |
+| **Alpha** | `alpha` | `0.2.0-alpha.*` | Bleeding edge. Changes often. |
 
-Phase 1 resolves "latest RC" via `next` → `latest` → **hard failure** (never a silent alpha fallback).
+**Note on spec drift:** earlier versions of this document referenced a `latest-rc` dist-tag that does not exist. The implementation resolves "latest RC" via `next` → `latest` → **hard failure** (never a silent alpha fallback). The MD retains the historical reference for continuity; the code is authoritative.
 
 **First run:** downloads the latest **Stable** and the latest **Alpha** (two versions, not three). RC is opt-in from the Version Manager.
 
 **On-demand:** the user can download any specific version from the Version Manager, in the background, with progress indicators.
 
-**Background caching:** periodic NPM registry polling (see §3.2 for cadence). New releases are pre-downloaded automatically, bounded by a user-configurable limit (default 10 versions).
+**Background caching:** periodic NPM registry polling (see §3.2). New releases are pre-downloaded automatically, bounded by a user-configurable limit (default 10 versions).
 
-**Populating the library:** `npm install --prefix <version-dir> --cache <data-dir>/.npm-cache --no-audit --no-fund @deepseek-ai/dsh@<exact>`, producing a self-contained, resolvable dependency tree per version.
+**Populating the library:** `npm install --prefix <version-dir> --cache <data-dir>/.npm-cache --no-audit --no-fund @deepseek-ai/dsh@<exact>`.
 
 - Path layout: `<data-dir>\versions\<version>\node_modules\@deepseek-ai\dsh\lib\bin.js`.
 - Switching repoints to that `bin.js`. No reinstall, no copy.
 - **`--ignore-scripts` is deliberately NOT passed** — the harness needs its dependency postinstalls.
 
-**npm spawn pattern (CVE-2024-27980):** since the fix, Node refuses to spawn `.cmd`/`.bat` without `shell: true`. We locate npm's CLI script and invoke it with our own Node: `node <npm-cli.js> install ...`. Resolution order: `$npm_execpath` → `npm-cli.js` next to the node binary → standard global locations.
+**npm spawn pattern (CVE-2024-27980):** since the fix, Node refuses to spawn `.cmd`/`.bat` without `shell: true`. We locate npm's CLI script and invoke it with our own Node: `node <npm-cli.js> install ...`.
 
 **Storage management:** when the cache limit is exceeded, the launcher **prompts** the user — it never silently evicts.
 
-**Known failure mode (discovered v0.5.1):** a broken or partially-completed npm install produces a harness that crashes at boot with an opaque `ERR_MODULE_NOT_FOUND`. The install tree can be validated post-install by checking that key files exist. The repair path is: wipe `versions/` and `.npm-cache/`, reinstall. Phase 2 will add automatic validation.
+**Known failure mode:** a broken or partially-completed npm install produces a harness that crashes at boot with an opaque `ERR_MODULE_NOT_FOUND`. Phase 2 will add automatic validation.
 
 ### 3.2. Update Mechanism
 
-**Auto-update policy — a single setting with four options:**
+**Auto-update policy — four options:**
 
-| Option | Value in `settings.json` | What it does |
-| :--- | :--- | :--- |
-| **Stable only** | `"stable"` | Auto-update only when a stable release exists on the `latest` tag |
-| **RC only** | `"rc"` | Auto-update to the newest RC on the `next` tag |
-| **Alpha only** | `"alpha"` | Auto-update to the newest alpha on the `alpha` tag |
-| **All channels** | `"all"` | Auto-update to whichever channel has the newest release by version |
+| Option | Value in `settings.json` |
+| :--- | :--- |
+| **Stable only** | `"stable"` |
+| **RC only** | `"rc"` |
+| **Alpha only** | `"alpha"` |
+| **All channels** | `"all"` |
 
-Only one option is active at a time.
+Only one option is active at a time. When a channel has no release, the option is disabled in the menu.
 
-**When a channel has no release:** the corresponding option is disabled in the menu (visible but not clickable). Current example: no stable release exists yet, so "Stable only" is disabled.
+**Plus:** version pinning (overrides auto-update for a specific version).
 
-**Plus:** version pinning (overrides auto-update for a specific version — the harness stays on the pinned version until the user unpins).
+**Background polling cadence:** at most once per **12 hours**, recorded as `last_update_check`. `If-None-Match` with a stored ETag.
 
-**Background polling cadence:** at most once per **12 hours**, recorded as `last_update_check` in `settings.json`. `If-None-Match` with a stored ETag to avoid redundant downloads.
-
-**Minimum supported harness version:** a constant `MIN_SUPPORTED_DSH` in the sidecar. Still `"0.0.0"` after Phase 1 — the real value is derived in Phase 2.
+**Minimum supported harness version:** a constant `MIN_SUPPORTED_DSH` in the sidecar. Still `"0.0.0"` — the real value is derived in Phase 2.
 
 ### 3.3. Fast-Path Startup Sequence
 
@@ -290,33 +323,24 @@ Only one option is active at a time.
 
 **Critical property:** the network is never on the critical path of a startup.
 
-**Measured timings (v0.5.1, from logs):**
+**Measured timings (v0.5.1):**
 - Cold install: ~5 min (372 MB / 518 packages)
-- Warm boot (already installed): ~37–70s from spawn to URL
+- Warm boot: ~37–70s from spawn to URL
 - Adopt (next launcher start): <1s
 
 ### 3.4. Version Manager UI
 
 A table with columns **Version | Channel | Status | Action**.
 
-| Version | Channel | Status | Action |
-| :--- | :--- | :--- | :--- |
-| 1.1.0-rc.2 | RC | **Active** | [Switch] |
-| 1.1.0-rc.1 | RC | Downloaded | [Switch] [Delete] |
-| 1.0.0 | Stable | Downloaded | [Switch] [Delete] |
-| 1.0.0-alpha.5 | Alpha | Not Downloaded | [Download] |
-
 (Phase 2/3 work.)
 
 ### 3.5. Launcher Self-Update
 
-Distinct from harness updates. The **Tauri v2 Updater Plugin** updates *DSH-Dock itself* via GitHub Releases and a `latest.json` manifest. Silent, applies on next restart.
+Distinct from harness updates. The **Tauri v2 Updater Plugin** updates *DSH-Dock itself* via GitHub Releases and a `latest.json` manifest.
 
-**Code signing:** out of scope for v1.0.0. Ship unsigned; document the SmartScreen and Gatekeeper prompts clearly in the README.
+**Code signing:** out of scope for v1.0.0.
 
 ### 3.6. Control Surface (HTTP on the Sidecar)
-
-The sidecar exposes HTTP routes on its own loopback port. The frontend goes through Tauri commands (`harness_status`, `harness_start`, `harness_stop`), which proxy to these routes.
 
 | Route | Method | Returns |
 | :--- | :--- | :--- |
@@ -327,36 +351,19 @@ The sidecar exposes HTTP routes on its own loopback port. The frontend goes thro
 
 **Status states:** `stopped` | `starting` | `running` | `error`.
 
-**Errors are first-class.** When start fails, `lastError` names the failing step and includes the tail of the relevant log file.
-
-**`DSH_DOCK_START_ON_BOOT=1`** (env var) — hook for Phase 3.
-
 ### 3.7. Installer Behavior (Windows)
 
-The Windows installer is NSIS, per-user (`installMode: "currentUser"`), with a custom template at `src-tauri/nsis/installer.nsi` derived from tauri-bundler 2.9.4. Two body changes: the default install path and the disabled restore-registry-location call.
+NSIS, per-user (`installMode: "currentUser"`), custom template at `src-tauri/nsis/installer.nsi`. Two body changes: default install path and disabled restore-registry-location call.
 
-Payload layout at the installed directory:
-```
-%LOCALAPPDATA%\Programs\DSH-Dock\
-├── dsh-dock.exe
-├── uninstall.exe
-└── sidecar\
-    ├── index.js
-    ├── package.json
-    └── lib\*.js
-```
+### 3.8. Menu Content — Implemented Shape
 
-No `resources\sidecar\` — the sidecar is exe-adjacent. The Rust resolver's exe-adjacent branch finds it.
-
-### 3.8. Menu Content
-
-The native menu bar (§2.8) has three top-level items: **Harness**, **Dock**, **Settings**.
+The native menu bar has three top-level items on Windows/Linux (`Harness | Dock | Settings`) and a leading application menu on macOS (`DSH-Dock | Harness | Dock`).
 
 #### Harness section
 
 ```
 Harness ▸
-├── ● {status} · v{version}                [disabled label]
+├── ● {status} · v{version}                [disabled label, id: harness.status]
 ├── ─────────────
 ├── Restart Harness                        [action]
 ├── Stop Harness                           [action]
@@ -369,18 +376,13 @@ Harness ▸
 │   └── ○ All channels (newest)            [CheckMenuItem]
 ├── Recent Versions ▸                      [submenu]
 │   ├── v0.1.5-rc.2 (installed)            [disabled label]
-│   ├── v0.1.5-rc.1                        [action: switch]
-│   ├── v0.1.5-alpha.2                     [action: switch]
-│   ├── v0.1.4-rc.3                        [action: switch]
-│   ├── v0.1.4-rc.2                        [action: switch]
-│   └── Show all versions…                 [opens version manager]
+│   ├── … up to 5 recent versions
+│   └── Show all versions…                 [disabled until Phase 2]
 ├── ─────────────
-└── Harness Update                         [checks now]
+└── Harness Update                         [action]
 ```
 
-**Status label** values: `● Running · v0.1.5-rc.2`, `● Stopped`, `● Starting…`, `● Error`. Updates on every state change.
-
-**Recent Versions submenu** shows the 5 most recent releases by date. The installed one is marked `(installed)` and is disabled. Others are clickable to switch. "Show all versions…" opens the control panel to the Version Manager tab.
+**Status label** values: `● Running · v0.1.5-rc.2`, `● Stopped`, `● Starting…`, `● Error`.
 
 #### Dock section
 
@@ -388,14 +390,24 @@ Harness ▸
 Dock ▸
 ├── Current version: 0.5.1                [disabled label]
 ├── ─────────────
-├── Dock Update                            [checks for launcher updates]
-├── Show Control Panel                     [opens settings window]
-└── About DSH-Dock                         [opens About]
+├── Dock Update                            [action — placeholder until Phase 3]
+├── Show Control Panel                     [action]
+└── About DSH-Dock                         [os predefined: about — Windows/Linux only]
 ```
 
 #### Settings
 
-A top-level item that opens the control panel window to the Settings tab. On macOS it's placed under the app menu automatically (per macOS convention).
+A top-level `Settings` submenu on Windows/Linux. On macOS, moved under the app menu.
+
+#### Action Routing — Menu to Dashboard
+
+All actionable menu items emit a `menu:action` event to the `main` window with a payload of `{ action: "start" | "stop" | "restart" | "refresh" | "open-logs" }`. The dashboard's `App.svelte` subscribes and dispatches to the same handlers its buttons call.
+
+**Rule:** one implementation per action, reachable from two entry points. Menu handlers do **not** call the sidecar's HTTP routes directly; they route intent through the dashboard.
+
+**Exception:** `open-logs` — the event is forwarded for consistency, but the shell reveals the folder itself because there is no dashboard state to keep in step.
+
+**Undeliverable case:** if the dashboard window is closed when a menu action fires, the shell logs `menu: could not deliver '<action>' - the control panel is not open`. Phase 3.5.x will add a pending-action slot the dashboard drains on mount.
 
 ### 3.9. First-Run Experience
 
@@ -416,49 +428,19 @@ Which harness channel would you like to track?
 ```
 
 **Behavior:**
-- Choosing a channel saves it to `settings.json` as `auto_update_channel`.
-- "Install and Open Harness" triggers the install of the latest version on the chosen channel, then opens the harness window.
+- Choosing a channel writes `auto_update_channel` and `first_run_completed = true` in **one atomic call** (`complete_first_run` in `settings.rs`).
+- "Install and Open Harness" triggers the install and emits `install-and-open`.
 - Closing without choosing defaults to `rc` and proceeds anyway.
-- The chosen channel can be changed later via the menu or the settings window.
-
-**Platform adaptations:**
-- **Windows/macOS:** the welcome window is the first thing the user sees.
-- **Linux:** same welcome window. The tray may never appear (depending on the desktop); the app menu entry is the durable anchor.
 
 ### 3.10. Update Notification
 
 **Background flow:**
 
-1. Launcher polls the npm registry (12h cadence, ETag-aware — §3.2).
-2. If a newer version exists on the tracked channel, download it silently in the background.
-3. Once downloaded, show a **system notification**.
-
-**Notification content:**
-```
-Title: DSH-Dock
-Body:  Harness update available: v{new-version}
-       Run now or apply on next launch.
-```
-
-**User actions:**
-
-| Action | Behavior |
-| :--- | :--- |
-| Click "Run now" (where supported) | Stop the running harness, start the new version, reopen the harness window |
-| Click notification body | Open the control panel with an "Update available" banner |
-| Ignore notification | Update applies automatically on next launcher start |
-
-**Cross-platform notification support:**
-
-| Platform | System notification | Action buttons |
-| :--- | :--- | :--- |
-| Windows | ✅ Toast (Action Center) | ✅ |
-| macOS | ✅ Notification Center | ✅ (signed app recommended) |
-| Linux | ✅ Depends on daemon | ⚠️ Not always supported |
-
-**Fallback:** if the OS doesn't support action buttons, clicking the notification opens the control panel where the update banner has "Restart now" / "Later" buttons.
-
-**The critical property:** the update applies on next launch regardless of whether the notification was seen. The update is never forced, but it also never gets lost.
+1. Launcher polls the npm registry (12h cadence, ETag-aware).
+2. New version → download silently.
+3. Show a system notification.
+4. Click "Run now" → stop, start new version, reopen harness window.
+5. Ignore → applies on next launcher start.
 
 ### 3.11. Settings Model — Single Source of Truth
 
@@ -468,34 +450,26 @@ Every launcher setting lives in exactly one file:
 <data-dir>/settings.json
 ```
 
-Both surfaces — the native menu bar and the web settings window — read from and write to this file. There is no secondary state cache.
-
-**Current fields:**
+Current fields:
 ```json
 {
   "auto_update_channel": "rc",
   "preferred_version": null,
   "cache_limit": 10,
   "last_update_check": null,
-  "etag": null
+  "etag": null,
+  "first_run_completed": false
 }
 ```
 
-**Flow when the user changes a setting from the menu:**
-1. Rust handler mutates the in-memory settings struct.
-2. Rust writes `settings.json`.
-3. Rust rebuilds the menu (checkbox state reflects the new value).
-4. Rust emits a `settings-changed` Tauri event.
-5. If the settings window is open, it receives the event and updates its UI.
+Both the native menu bar and the web settings window read from and write to this file. Neither caches state across sessions. Whoever changes a setting last wins, and both surfaces reflect the current state on open.
 
-**Flow when the user changes a setting from the settings window:**
-1. Frontend calls a Tauri command (e.g. `set_auto_update_channel("alpha")`).
-2. Rust handler mutates the in-memory settings struct.
-3. Rust writes `settings.json`.
-4. Rust rebuilds the menu (checkbox state reflects the new value).
-5. The settings window already shows the correct state (it initiated the change).
+**Two writers:** the Rust shell and the Node sidecar both write this file. Safeguards:
+- Atomic replace (temp file + rename).
+- Unknown-key preservation (fields the writer doesn't know about survive a rewrite).
+- Single shared `data_dir()` resolver used by both the settings writer and `launcher_log_path()`.
 
-**The rule:** whoever changes the setting last wins, and both surfaces reflect the current state on open. Neither caches state across sessions. There is no authoritative surface — they are views onto the same data.
+**Long-term ownership** (which side owns the file) is a Phase 2 decision.
 
 ### 3.12. Explicit Non-Goals for v1.0
 
@@ -512,210 +486,114 @@ Both surfaces — the native menu bar and the web settings window — read from 
 | Phase | Duration | Target | Key Milestones |
 | :--- | :--- | :--- | :--- |
 | **Phase 0: Foundation** | ✅ Complete 2026-09-10 | Project scaffold and IPC proof. | All milestones ✅. |
-| **Phase 1: MVP Core** | ✅ Complete 2026-09-13 | Install and run one hardcoded version; adopt/reap; embedded webview. | All milestones ✅. |
+| **Phase 1: MVP Core** | ✅ Complete 2026-09-13 | Install + run one hardcoded version; adopt/reap; embedded webview. | All milestones ✅. |
 | **v0.5.0 release** | ✅ Complete 2026-09-13 | Public pre-release. | Published with known installer issues. |
-| **v0.5.1 fix** | ✅ Complete 2026-09-14 | Installer packaging fix. | Sidecar bundled, install/data dirs separated, restore call disabled, packaging-check.ps1 added. |
-| **Menu Bar + First-Run** | 1 week | Native menu bar + first-run wizard + settings plumbing. | 1. Rust menu builder with Harness / Dock / Settings sections. <br> 2. Menu items for active actions (Restart, Stop, Open Logs, Show Control Panel). <br> 3. Passive items stubbed (Auto-update toggles save state; Recent Versions empty until Phase 2). <br> 4. First-run wizard window with channel selection. <br> 5. `settings.json` plumbing with single source of truth. <br> 6. Cross-platform verification on Windows + macOS + Linux. |
-| **Phase 2: Version Library & Dynamic Port** | 3 weeks | Multi-version management. | 1. Library directory structure generalized. <br> 2. Multi-version download (on-demand + background). <br> 3. Version switching in the UI. <br> 4. Storage management prompts. <br> 5. `MIN_SUPPORTED_DSH` derived from evidence. <br> 6. Job Object for orphan prevention. <br> 7. Install tree validation after npm install. <br> 8. Populate Recent Versions submenu from the library. |
-| **Phase 3: Settings & Update UI** | 3 weeks | Full settings surface. | 1. Version Manager table UI. <br> 2. Update Preferences UI. <br> 3. Background check + notification system (wire to §3.10). <br> 4. Tauri v2 Updater integration. <br> 5. Channel selection and pinning UI. |
-| **Tray (post-Phase 3)** | 1 week | System tray as secondary surface. | 1. Tray icon appears where supported. <br> 2. Tray menu mirrors the native menu bar's quick actions. <br> 3. Graceful degradation on GNOME/Linux. |
-| **Phase 4: Polish & Release** | 2 weeks | v1.0.0. | 1. Cross-platform builds (`.exe`, `.dmg`, `.AppImage`). <br> 2. Bundled Node runtime. <br> 3. Docs + SECURITY.md. <br> 4. `--remap-path-prefix`. <br> 5. v1.0.0 release. |
+| **v0.5.1 fix** | ✅ Complete 2026-09-14 | Installer packaging fix. | Sidecar bundled, install/data dirs separated, restore call disabled. |
+| **Pause 3: Menu Bar + First-Run Wiring** | ✅ Complete 2026-10-02 | Native menu bar + settings plumbing + fast-path update. | 1. `menu.rs` with Harness/Dock/Settings. ✅ <br> 2. Menu items route to dashboard handlers. ✅ <br> 3. `settings.rs` with atomic writes + unknown-key preservation. ✅ <br> 4. Status-label fast path (0 ms vs 37 ms rebuild). ✅ <br> 5. Cross-platform verification (Windows only; macOS/Linux deferred). ✅ |
+| **Pause 4: First-Run Wizard** | 1 week | Welcome window + channel selection + install-and-open. | 1. `welcome.rs` + `Welcome.svelte`. <br> 2. `welcome_submit` command + capability. <br> 3. `install-and-open` event. <br> 4. First-run gate in `setup`. |
+| **Phase 2: Version Library & Dynamic Port** | 3 weeks | Multi-version management. | 1. Library directory structure generalized. <br> 2. Multi-version download. <br> 3. Version switching in the UI. <br> 4. Storage management prompts. <br> 5. `MIN_SUPPORTED_DSH` derived from evidence. <br> 6. Job Object for orphan prevention. <br> 7. Install tree validation after npm install. |
+| **Phase 3: Settings & Update UI** | 3 weeks | Full settings surface. | 1. Version Manager table UI. <br> 2. Update Preferences UI. <br> 3. Background check + notification system. <br> 4. Tauri v2 Updater integration. <br> 5. Channel selection and pinning UI. |
+| **Phase 4: Polish & Release** | 2 weeks | v1.0.0. | 1. System tray. <br> 2. Cross-platform builds. <br> 3. Bundled Node runtime. <br> 4. Docs + SECURITY.md. <br> 5. `--remap-path-prefix`. <br> 6. v1.0.0 release. |
 
-**Total estimated timeline: 12 weeks.**
+**Total estimated timeline: ~12 weeks.**
 
-### 4.1. Phase 0 Deliverables
-
-**Root:** `package.json`, `package-lock.json`, `vite.config.ts`, `tsconfig.json`, `.gitignore`
-
-**`src/`:** `index.html`, `main.ts`, `App.svelte`, `svelte.config.js`, `styles/global.css`
-
-**`sidecar/`:** `index.js`, `package.json`, `lib/protocol.js`, `lib/service.js`, `lib/version-manager.js`, `lib/state.js`, `lib/registry.js`, `test/handshake.ps1`, `test/smoke.js`
-
-**`src-tauri/`:** `Cargo.toml`, `Cargo.lock`, `build.rs`, `tauri.conf.json`, `NOTES.md`, `src/main.rs`, `src/lib.rs`, `capabilities/default.json`, `test/window-check.ps1`, `icons/`
-
-### 4.2. Phase 1 Deliverables
-
-**`sidecar/lib/`** — new: `control.js`, `harness-install.js`, `harness-start.js`, `harness.js`, `platform.js`. Rewritten: `registry.js`, `service.js`, `state.js`, `version-manager.js`
-
-**`sidecar/test/`** — new: `control.js`, `control-live.js`, `harness.js`, `harness-install.js`, `harness-start.js`, `platform.js`, `registry.js`, `state.js`, `lib/check.js`, `lib/fake-npm.js`, `lib/noop-child.js`
-
-**`src-tauri/`** — modified: `Cargo.toml`, `Cargo.lock`, `build.rs`, `capabilities/default.json`, `src/lib.rs`. New: `capabilities/harness.json`, `permissions/autogenerated/*.toml`, `test/acceptance.ps1`, `test/console-check.ps1`, `test/console-probe.rs`, `test/manual-ui-check.ps1`
-
-**`src/`** — modified: `App.svelte`. New: `lib/sidecar-connection.js`, `test/sidecar-connection.test.js`
-
-### 4.3. v0.5.1 Fix Deliverables
+### 4.1. Pause 3 Deliverables
 
 **New:**
-- `scripts/stage-sidecar.mjs` — exclusion-based staging script
-- `src-tauri/nsis/installer.nsi` — custom NSIS template
-- `src-tauri/test/packaging-check.ps1` — packaging regression gate (7 assertions)
+- `src-tauri/src/menu.rs` — plan/adapter split, `MenuState`, `MenuPlan`, `MenuAction`, recursive `installed_item`, fast-path `set_text` update, action dispatch to dashboard.
+- `src-tauri/src/settings.rs` — `Settings` struct, atomic I/O, unknown-key preservation, `first_run_completed`, `complete_first_run`, `validate_channel`, shared `data_dir()` resolver.
 
 **Modified:**
-- `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json` — version 0.5.1
-- `src-tauri/src/lib.rs` — resolver rework (three-branch), absolute sidecar path
-- `src-tauri/NOTES.md` — packaging gate documentation
+- `src-tauri/src/lib.rs` — `mod menu`, `mod settings`, `manage(MenuRuntime)`, `manage(SettingsState)`, initial rebuild, status watcher, `on_menu_event` wiring, `menu:action` emission.
+- `src/App.svelte` — `menu:action` listener, `restartHarness`, `runMenuAction` routing to existing handlers.
+- `src-tauri/NOTES.md` — menu architecture, the fast path, the low-integrity WebView2 failure signature, all diagnostics.
+
+**Verified:** 130 Rust tests, clippy clean, `svelte-check` 0/0. Fast-path status updates 0 ms (was 23 ms median). Menu label visibly retitles on screen.
 
 ---
 
 ## 5. Repository Layout
 
-**The repo root is the project root.**
-
 ```
 DSH-Launcher/
-├── .github/workflows/           # Phase 4
-├── .gitignore
-├── LICENSE
-├── README.md
-├── SECURITY.md
-│
 ├── docs/
 │   ├── PROJECT_DSH-DOCK.md
 │   └── assets/
-│       ├── icon.ico
-│       └── screenshots/
-│
-├── scripts/
-│   └── stage-sidecar.mjs        # v0.5.1: stages sidecar into build output
-│
+├── scripts/stage-sidecar.mjs
 ├── src/
 │   ├── index.html
 │   ├── main.ts
-│   ├── App.svelte
+│   ├── App.svelte              # menu:action listener + dashboard
 │   ├── svelte.config.js
 │   ├── lib/sidecar-connection.js
-│   ├── styles/global.css
 │   └── test/sidecar-connection.test.js
-│
 ├── src-tauri/
 │   ├── src/
 │   │   ├── main.rs
-│   │   ├── lib.rs
-│   │   ├── menu.rs              # NEW: native menu builder
-│   │   ├── settings.rs          # NEW: settings struct + I/O
-│   │   └── welcome.rs           # NEW: first-run wizard window
-│   ├── nsis/
-│   │   └── installer.nsi        # v0.5.1: custom NSIS template
-│   ├── capabilities/
-│   │   ├── default.json
-│   │   └── harness.json
+│   │   ├── lib.rs               # wiring, watcher, commands
+│   │   ├── menu.rs              # NEW — menu plan/adapter/fast path
+│   │   └── settings.rs          # NEW — settings model
+│   ├── nsis/installer.nsi
+│   ├── capabilities/default.json + harness.json
 │   ├── permissions/autogenerated/
-│   ├── test/
-│   │   ├── acceptance.ps1
-│   │   ├── console-check.ps1
-│   │   ├── console-probe.rs
-│   │   ├── menu-check.ps1       # NEW: menu structure verification
-│   │   ├── manual-ui-check.ps1
-│   │   ├── packaging-check.ps1
-│   │   └── window-check.ps1
+│   ├── test/                    # acceptance.ps1, packaging-check.ps1, etc.
 │   ├── icons/
 │   ├── Cargo.toml
-│   ├── Cargo.lock
-│   ├── build.rs
 │   ├── tauri.conf.json
 │   └── NOTES.md
-│
-├── sidecar/
-│   ├── index.js
-│   ├── package.json
-│   ├── lib/
-│   │   ├── protocol.js
-│   │   ├── service.js
-│   │   ├── version-manager.js
-│   │   ├── state.js
-│   │   ├── registry.js
-│   │   ├── harness-install.js
-│   │   ├── harness.js
-│   │   ├── harness-start.js
-│   │   ├── control.js
-│   │   └── platform.js
-│   └── test/
-│       ├── handshake.ps1
-│       ├── smoke.js
-│       ├── state.js, platform.js, registry.js
-│       ├── harness.js, harness-install.js, harness-start.js
-│       ├── control.js, control-live.js
-│       └── lib/
-│           ├── check.js
-│           ├── fake-npm.js
-│           └── noop-child.js
-│
+├── sidecar/                     # unchanged from v0.5.1
 ├── legacy/
-│   └── (preserved; never referenced)
-│
-├── vite.config.ts
-├── tsconfig.json
 └── package.json
 ```
-
-### 5.1. Workspace Layout Notes
-
-- **npm workspaces.** Root `package.json` declares `"workspaces": ["sidecar"]` and `"private": true`.
-- **`src/svelte.config.js`, not root.** `vite-plugin-svelte` resolves its config relative to Vite's `root`.
-- **`src-tauri/gen/` is gitignored.**
-- **`src-tauri/permissions/autogenerated/` is committed.**
-- **`src-tauri/nsis/installer.nsi` is committed.** Must be re-synced against upstream tauri-bundler on Tauri upgrades — see its header.
-- **`src-tauri/src/menu.rs` is the single source of the menu structure.** All menu items, submenus, and event handlers live there. The menu builder function is pure: it reads `MenuState` and returns a `Menu`. No side effects during construction.
-
-### 5.2. About the `legacy/` Folder
-
-Historical reference only. Do not read, import from, modify, or delete.
 
 ---
 
 ## 6. Git and Repository Conventions
 
 - Repo: `https://github.com/MIHassan3/DSH-Launcher`.
-- `.gitignore` excludes: `node_modules/`, `src-tauri/target/`, `src-tauri/gen/`, `src-tauri/binaries/*.exe`, `src-tauri/binaries/*.bin`, `dist/`, `*.log`, `.DS_Store`, `Thumbs.db`, `desktop.ini`, `.npm-cache/`, `.test-tmp/`.
+- `.gitignore` at repo root excludes: `node_modules/`, `src-tauri/target/`, `src-tauri/gen/`, `dist/`, `*.log`, `desktop.ini`, `.npm-cache/`, `.test-tmp/`.
 - **Path hazard:** parent folder name contains a space. Quote everything.
-- **Hash reproducibility:** Windows builds are not byte-reproducible (PE timestamps). Hash the shipped artifact.
+- **Hash reproducibility:** Windows builds are not byte-reproducible. Hash the shipped artifact.
 
 ---
 
-## 7. Recommendations for Development (Dev Guidance — Not Product Spec)
-
-This section is for **us building DSH-Dock**. It is not a runtime dependency of the product.
+## 7. Recommendations for Development
 
 ### 7.1. Model Settings
 
 - **Model:** DeepSeek V4.1 Flash.
-- **Modes:** Expert for architecture; Vision for UI mockups.
 
 ### 7.2. Useful Harness Plugins
 
-1. **`dsh-mcp-manage`** — GUI for MCP servers.
-2. **`dsh-claude-compat`** — folds `.claude/` rules into sessions.
-3. **`prompt-skill-armory`** — management panel for prompts and presets.
+- `dsh-mcp-manage`, `dsh-claude-compat`, `prompt-skill-armory`.
 
 ### 7.3. Development Tools
 
-- **Node.js v22.19+ LTS** (dev uses whatever's installed; shipped bundle pins 22.x in Phase 4).
-- **Tauri v2 CLI** — `cargo install tauri-cli --version "^2"`.
-- **Rust 1.84.0+** — verified with 1.98.1.
-- **GitHub Actions** — Phase 4 CI.
+- **Node.js v22.19+ LTS**, **Tauri v2 CLI**, **Rust 1.84.0+**, **GitHub Actions** (Phase 4).
 
-### 7.4. Testing Discipline (Lessons from Phases 0, 1, and v0.5.1)
+### 7.4. Testing Discipline
 
-**Acceptance testing must use the release binary with no dev server running.** Debug builds load from `devUrl` and mask bugs that only appear when the frontend is embedded.
+**Acceptance testing must use the release binary with no dev server running.** Debug builds load from `devUrl` and mask bugs.
 
-**Every release must be tested from the actual installed artifact — not just the repo-built exe.** This is the lesson that cost us the v0.5.0 installer bug. The installer payload, the default install directory, and the uninstaller's behavior all need verification against the shipped artifact.
+**Every release must be tested from the actual installed artifact.**
 
-**Verify on a clean VM.** The dev machine accumulates state that hides bugs.
+**Verify on a clean VM.**
 
-**Native menu testing requires a real OS window.** Unit tests can verify the menu structure (item counts, IDs, event handlers), but cross-platform placement and behavior must be verified visually on each of Windows, macOS, and Linux. Plan a three-OS verification pass for the menu bar.
+**Three tiers of test:** live tests against the real harness → integration tests against real processes → unit tests.
 
-**Menu rebuilds are cheap but not free.** Every state change triggers a full menu rebuild. Keep the `MenuState` struct small and the rebuild function fast (target: <5ms).
+**Packaging regression gate.** `src-tauri/test/packaging-check.ps1` runs after `cargo tauri build` and before publishing.
 
-**Three tiers of test, in order of value:**
-1. **Live tests against the real harness** — they catch what stubs never will.
-2. **Integration tests against real processes and fixtures** — adopt/reap identity checks, control surface.
-3. **Unit tests** — fast, but they can pass while the artifact on disk is broken.
+**Performance targets — two distinct cases:**
+- **Steady-state status-label updates:** < 5 ms. Currently **0 ms** (in-place `MenuItem::set_text`).
+- **Structural rebuilds:** informational only (~37 ms on Windows release). These are rare and user-initiated (channel checkbox, recent-versions list changes). Not a target.
 
-**Packaging regression gate.** `src-tauri/test/packaging-check.ps1` runs after `cargo tauri build` and before publishing. Seven assertions. Exits non-zero on failure.
+**Session hygiene for DSH.** Very large sessions cause stream idle timeouts. Start fresh sessions per major phase or per focused fix.
 
-**Session hygiene for DSH.** A single DSH session has a context limit — very large sessions cause stream idle timeouts. Start fresh sessions per major phase or per focused fix. The MD file is the memory that survives across sessions.
+**Do not run destructive tests inside a session that depends on the target.**
 
-**Do not run destructive tests inside a session that depends on the target.** DSH running inside the harness that DSH-Dock launched is self-hosting — its tests can kill its own host. Isolation is mandatory for any test that uninstalls or force-kills the launcher.
+**If a fresh build renders no window AND `window probe` reports no handle, suspect integrity before code.** Check `icacls <path>` for a `Low Mandatory Level` label. Fix: `icacls <path> /setintegritylevel "(OI)(CI)M" /T /C`.
+
+**Menu builder API is immutable; individual items are not.** Structural change requires full rebuild + `set_menu`. Pure text/enable/check change can use in-place `MenuItem::set_text` / `set_enabled` / `set_checked`.
 
 ---
 
@@ -723,45 +601,38 @@ This section is for **us building DSH-Dock**. It is not a runtime dependency of 
 
 | # | Question | Decision |
 | :--- | :--- | :--- |
-| Q1–Q44 | (See v2.3.0 history for full log) | — |
-| Q45 | Menu surface | **Native window menu bar** (Tauri `MenuBuilder`). Not custom titlebar, not tray-first, not DOM injection. |
-| Q46 | Menu labels | **Harness \| Dock \| Settings**. |
-| Q47 | Auto-update options | **Four**: Stable only, RC only, Alpha only, All channels. One active at a time. |
-| Q48 | Stable option when no stable exists | **Disabled** (visible but not clickable). Re-enables when a stable release appears on `latest`. |
-| Q49 | Recent versions in menu | **Five most recent** by release date + "Show all versions…" opening the full version manager. |
-| Q50 | Update action naming | **"Harness Update"** in Harness section; **"Dock Update"** in Dock section. Avoids ambiguity. |
-| Q51 | First-run experience | Small centered window with a single question (channel selection). One button. Defaults to `rc` if closed. |
-| Q52 | Update notification | System notification + **next-launch fallback**. The update is never forced, never lost. |
-| Q53 | Settings source of truth | `<data-dir>/settings.json`. Both the menu and the settings window read/write. Event-driven sync via `settings-changed`. |
-| Q54 | Tray timing | **Deferred until after Phase 2/3**. When added, it mirrors the menu content — it does not replace it. |
-| Q55 | Menu bar build timing | **Pre-Phase-2**. Standalone work during the v0.5.1 post-release pause. |
+| Q1–Q55 | (See v2.4.0 history) | — |
+| Q56 | Menu-change mechanism? | **Two paths.** Full rebuild for structural change; in-place `set_text` fast path for status-label-only changes. The fast path's guard is a full plan comparison, so it declines automatically on any future difference. |
+| Q57 | Menu item lookup by id? | **Recursive walk** (`installed_item`), not `Menu::get` — the latter searches direct children only (tauri 2.11.5 `menu/menu.rs:363`). |
+| Q58 | Menu action routing? | Menu items emit `menu:action` to `main`; the dashboard dispatches to its own handlers. One implementation per action, two entry points. `open-logs` is the sole exception (shell reveals the folder). |
+| Q59 | `installed_ids` diagnostic? | **Kept permanently.** Runs only on the fast-path failure branch. Names the id wanted and every id present. |
+| Q60 | Low-integrity WebView2 failure? | Environmental, not code. Fixed by `icacls /setintegritylevel "(OI)(CI)M" /T /C`. Documented in §2.7 and NOTES.md. |
+| Q61 | `first_run_completed`? | Added to `settings.json` schema. Written together with channel in one `complete_first_run` call. |
 
 ### 8.1. Deferred to Phase 2
 
 - **Windows Job Object** for orphan prevention (sidecar + harness + WebView2).
 - **`MIN_SUPPORTED_DSH`** value derived from real install + boot + switch testing.
-- **Install tree validation** after `npm install` — verify key files exist before declaring success.
-- **Sidecar "no port" flash** — the current 2-second retry budget is tight on cold VM starts; extend or make configurable.
-- **Recent Versions submenu population** — the menu item exists after the menu bar build, but is empty until the library is populated.
+- **Install tree validation** after `npm install`.
+- **Sidecar "no port" flash** — retry budget extension.
+- **Recent Versions submenu population.**
+- **Settings-file writer ownership** decision (Rust vs sidecar).
 
-### 8.2. Deferred to Phase 4
+### 8.2. Deferred to Phase 3.5.x
 
-- **`--remap-path-prefix`** in release builds (privacy).
-- **Bundled Node runtime** as a Tauri resource.
-- **MSI installer** with a matching custom template.
-- **Code signing / notarization** (post-1.0).
-- **`--ignore-scripts`** revisit for install hardening.
+- **Undeliverable-action slot** — dashboard closed, menu action fired. Pending-action queue the dashboard drains on mount. Requires a new command + capability entry.
+- **Fast-path `set_text` for other menu items** if Phase 3 introduces more text-only updates.
+
+### 8.3. Deferred to Phase 4
+
+- **`--remap-path-prefix`**, **bundled Node runtime**, **MSI installer**, **code signing**.
 
 ---
 
 ## 9. Visual Identity
 
 - **Icon:** `docs/assets/icon.ico`.
-- **Palette:**
-  - Primary: Deep Blue `#1E3A5F`
-  - Accent: Cyan `#00B4D8`
-  - Background: Dark Charcoal `#1A1A1A`
-  - Text: Off-White `#F0F0F0`
+- **Palette:** Deep Blue `#1E3A5F`, Cyan `#00B4D8`, Dark Charcoal `#1A1A1A`, Off-White `#F0F0F0`.
 - **Typography:** Segoe UI (Windows), SF Pro (macOS), Inter (cross-platform web UI).
 
 ---
