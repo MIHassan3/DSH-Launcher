@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-welcome-submit"
+description = "Enables the welcome_submit command without any pre-configured scope."
+commands.allow = ["welcome_submit"]
+
+[[permission]]
+identifier = "deny-welcome-submit"
+description = "Denies the welcome_submit command without any pre-configured scope."
+commands.deny = ["welcome_submit"]

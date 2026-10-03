@@ -1,8 +1,8 @@
 # DSH-Dock: A Unified Framework for a Professional DeepSeek Harness Launcher
 
-**Document Version:** 2.5.0
-**Last Updated:** 2026-10-02
-**Status:** Pause 3 + 3.5 complete — Pause 4 ready to begin
+**Document Version:** 2.6.0
+**Last Updated:** 2026-10-03
+**Status:** Pause 4 complete — Phase 2 ready to begin
 
 ---
 
@@ -409,9 +409,11 @@ All actionable menu items emit a `menu:action` event to the `main` window with a
 
 **Undeliverable case:** if the dashboard window is closed when a menu action fires, the shell logs `menu: could not deliver '<action>' - the control panel is not open`. Phase 3.5.x will add a pending-action slot the dashboard drains on mount.
 
-### 3.9. First-Run Experience
+### 3.9. First-Run Experience — Implemented
 
-On first launch, a small window (approximately 500×300, centered) appears.
+On first launch — `settings.first_run_completed == false` — a small centered window titled "Welcome to DSH-Dock" appears, and the main window is hidden (not closed) behind it.
+
+**Window:** `welcome` (label), inner size 500×300 logical, built at runtime by `welcome.rs`, not declared in `tauri.conf.json`. The app-wide menu bar is explicitly cleared on this window only and re-cleared after every structural rebuild, so it never carries `Harness | Dock | Settings`.
 
 **Content:**
 ```
@@ -428,9 +430,17 @@ Which harness channel would you like to track?
 ```
 
 **Behavior:**
-- Choosing a channel writes `auto_update_channel` and `first_run_completed = true` in **one atomic call** (`complete_first_run` in `settings.rs`).
-- "Install and Open Harness" triggers the install and emits `install-and-open`.
-- Closing without choosing defaults to `rc` and proceeds anyway.
+
+- Choosing a channel and clicking **Install and Open Harness** writes `auto_update_channel` and `first_run_completed = true` in a single atomic call (`complete_first_run` in `settings.rs`).
+- The hand-off closes the wizard with `window.destroy()`, **not** `window.close()`. In Tauri v2, `close()` emits `CloseRequested` — indistinguishable from a user X press — which our handler vetoes to run the dismissal path; using `close()` therefore caused a re-entrant loop. `destroy()` emits no events and cannot re-enter the handler. Pinned by a unit test (`the_wizard_is_destroyed_and_never_closed`).
+- The dashboard is then shown / unminimized / focused, and an `install-and-open` event is emitted to `main`. The dashboard's listener routes it through its existing start flow: `stopped` → start; `starting` → wait for `running` then open the harness window; `running` → open immediately. No second implementation of "start."
+- **Race tolerance:** if the dashboard's page has not finished loading when the event is emitted, the shell holds the intent and delivers on the next `page load finished`. The intent is cleared after successful emission. The `DSH_DOCK_AUTO_OPEN_HARNESS` diagnostic checks `harness_window_open` first, so it cannot conflict with the wizard path.
+- Closing the wizard with the X button (or the "Skip for now" control) submits the default channel (`rc`) with `dismissed = true` and completes the first run. A first run cannot leave the user stuck with a wizard that reappears forever.
+- If `complete_first_run` fails (unresolvable data dir), the wizard stays open with an inline error message — consistent with the "a failed write must not advance memory" invariant in `settings.rs`.
+
+**Scope note:** the channel written by the wizard is recorded for Phase 2 to consume. In Pause 4 the sidecar does not yet read `auto_update_channel`, so "Install and Open Harness" installs the same version regardless of the choice. Recorded in `NOTES.md`.
+
+**Diagnostic env var:** `DSH_DOCK_WELCOME_ACTION=rc|alpha|all|dismiss`, read in `setup`, fires the same `submit_and_hand_off` the button and the X use after a short delay. Used only for automated acceptance testing; unset by default. An unrecognised value is logged (`not recognised; ignoring`) and the wizard stays open — never a wrong-channel submit.
 
 ### 3.10. Update Notification
 
@@ -490,7 +500,7 @@ Both the native menu bar and the web settings window read from and write to this
 | **v0.5.0 release** | ✅ Complete 2026-09-13 | Public pre-release. | Published with known installer issues. |
 | **v0.5.1 fix** | ✅ Complete 2026-09-14 | Installer packaging fix. | Sidecar bundled, install/data dirs separated, restore call disabled. |
 | **Pause 3: Menu Bar + First-Run Wiring** | ✅ Complete 2026-10-02 | Native menu bar + settings plumbing + fast-path update. | 1. `menu.rs` with Harness/Dock/Settings. ✅ <br> 2. Menu items route to dashboard handlers. ✅ <br> 3. `settings.rs` with atomic writes + unknown-key preservation. ✅ <br> 4. Status-label fast path (0 ms vs 37 ms rebuild). ✅ <br> 5. Cross-platform verification (Windows only; macOS/Linux deferred). ✅ |
-| **Pause 4: First-Run Wizard** | 1 week | Welcome window + channel selection + install-and-open. | 1. `welcome.rs` + `Welcome.svelte`. <br> 2. `welcome_submit` command + capability. <br> 3. `install-and-open` event. <br> 4. First-run gate in `setup`. |
+| **Pause 4: First-Run Wizard** | ✅ Complete 2026-10-03 | Welcome window + channel selection + install-and-open. | 1. `welcome.rs` + `Welcome.svelte`. ✅ <br> 2. `welcome_submit` command + capability. ✅ <br> 3. `install-and-open` event with pending-intent delivery. ✅ <br> 4. First-run gate in `setup`. ✅ <br> 5. Menu cleared on wizard window. ✅ <br> 6. Wizard destroyed via `destroy()` (not `close()`). ✅ <br> 7. Acceptance script `welcome-check.ps1` — 29/29. ✅ |
 | **Phase 2: Version Library & Dynamic Port** | 3 weeks | Multi-version management. | 1. Library directory structure generalized. <br> 2. Multi-version download. <br> 3. Version switching in the UI. <br> 4. Storage management prompts. <br> 5. `MIN_SUPPORTED_DSH` derived from evidence. <br> 6. Job Object for orphan prevention. <br> 7. Install tree validation after npm install. |
 | **Phase 3: Settings & Update UI** | 3 weeks | Full settings surface. | 1. Version Manager table UI. <br> 2. Update Preferences UI. <br> 3. Background check + notification system. <br> 4. Tauri v2 Updater integration. <br> 5. Channel selection and pinning UI. |
 | **Phase 4: Polish & Release** | 2 weeks | v1.0.0. | 1. System tray. <br> 2. Cross-platform builds. <br> 3. Bundled Node runtime. <br> 4. Docs + SECURITY.md. <br> 5. `--remap-path-prefix`. <br> 6. v1.0.0 release. |
@@ -510,6 +520,24 @@ Both the native menu bar and the web settings window read from and write to this
 
 **Verified:** 130 Rust tests, clippy clean, `svelte-check` 0/0. Fast-path status updates 0 ms (was 23 ms median). Menu label visibly retitles on screen.
 
+### 4.2. Pause 4 Deliverables
+
+**New:**
+- `src-tauri/src/welcome.rs` — wizard window construction, first-run gate decision (`gate_decision`), the atomic hand-off (`submit_and_hand_off`), the X-dismiss handler, `WizardOption` data, `parse_welcome_action` env var parser.
+- `src/lib/Welcome.svelte` — the wizard UI (radio group, Install and Open button, Skip for now, inline error area, busy state).
+- `src-tauri/capabilities/welcome.json` — grants exactly `core:default` + `allow-welcome-submit` to the `welcome` window.
+- `src-tauri/permissions/autogenerated/welcome_submit.toml` — build-generated; declared in `build.rs`'s AppManifest command list.
+- `src-tauri/test/welcome-check.ps1` — the four-case acceptance script (unset / rc-like / dismiss / invalid-env).
+
+**Modified:**
+- `src-tauri/build.rs` — `welcome_submit` added to the explicit `AppManifest::commands([…])` list (Tauri v2 does not auto-discover).
+- `src-tauri/src/lib.rs` — `pub mod welcome;`, `welcome_submit` in `invoke_handler`, first-run gate in `setup`, close-request handler for the `welcome` window, `install-and-open` delivery hook.
+- `src-tauri/src/menu.rs` — clear the app-wide menu on the `welcome` window after every rebuild while the window exists.
+- `src/App.svelte` — `{#if windowLabel !== "main"}<Welcome />{:else}…{/if}` branch; `onMount` returns immediately when the window is not `main`; `install-and-open` listener routing through the existing start flow.
+- `src-tauri/NOTES.md` — wizard section: the gate, the destroy-vs-close rationale, the pending-intent delivery, the capability surface, the `DSH_DOCK_WELCOME_ACTION` diagnostic.
+
+**Verified:** `cargo test` 161/161, clippy clean, `svelte-check` 0/0. Acceptance script 29/29. X-button dismissal verified by hand.
+
 ---
 
 ## 5. Repository Layout
@@ -523,18 +551,21 @@ DSH-Launcher/
 ├── src/
 │   ├── index.html
 │   ├── main.ts
-│   ├── App.svelte              # menu:action listener + dashboard
+│   ├── App.svelte              # menu:action + install-and-open listeners, dashboard
 │   ├── svelte.config.js
-│   ├── lib/sidecar-connection.js
+│   ├── lib/
+│   │   ├── sidecar-connection.js
+│   │   └── Welcome.svelte      # first-run wizard UI
 │   └── test/sidecar-connection.test.js
 ├── src-tauri/
 │   ├── src/
 │   │   ├── main.rs
 │   │   ├── lib.rs               # wiring, watcher, commands
-│   │   ├── menu.rs              # NEW — menu plan/adapter/fast path
-│   │   └── settings.rs          # NEW — settings model
+│   │   ├── menu.rs              # menu plan/adapter/fast path
+│   │   ├── settings.rs          # settings model
+│   │   └── welcome.rs           # first-run wizard + gate + hand-off
 │   ├── nsis/installer.nsi
-│   ├── capabilities/default.json + harness.json
+│   ├── capabilities/default.json + harness.json + welcome.json
 │   ├── permissions/autogenerated/
 │   ├── test/                    # acceptance.ps1, packaging-check.ps1, etc.
 │   ├── icons/
@@ -595,6 +626,8 @@ DSH-Launcher/
 
 **Menu builder API is immutable; individual items are not.** Structural change requires full rebuild + `set_menu`. Pure text/enable/check change can use in-place `MenuItem::set_text` / `set_enabled` / `set_checked`.
 
+**Tauri's `window.close()` emits `CloseRequested`.** It is indistinguishable from a user X press. If a `CloseRequested` handler vetoes with `prevent_close()`, a programmatic `close()` will be vetoed too, and any code path that then re-issues the close will loop inside the event loop with no visible failure. Programmatic window dismissal from inside our own code must use `window.destroy()`, which emits no events. The `welcome.rs` hand-off and X handler are the reference implementation: `destroy()` for the hand-off, `close()`-vetoed for the X. Pinned by `the_wizard_is_destroyed_and_never_closed`.
+
 ---
 
 ## 8. Architectural Decisions Log
@@ -608,6 +641,11 @@ DSH-Launcher/
 | Q59 | `installed_ids` diagnostic? | **Kept permanently.** Runs only on the fast-path failure branch. Names the id wanted and every id present. |
 | Q60 | Low-integrity WebView2 failure? | Environmental, not code. Fixed by `icacls /setintegritylevel "(OI)(CI)M" /T /C`. Documented in §2.7 and NOTES.md. |
 | Q61 | `first_run_completed`? | Added to `settings.json` schema. Written together with channel in one `complete_first_run` call. |
+| Q62 | Wizard close mechanism? | **`window.destroy()`**, not `window.close()`. Tauri's `close()` emits `CloseRequested` (indistinguishable from user X), which our handler vetoes; using `close()` caused a re-entrant loop. `destroy()` emits no events. Pinned by test. |
+| Q63 | Wizard submit endpoint? | One function, `submit_and_hand_off`, used by the button, the X-dismiss handler, and the diagnostic env var. Never two implementations. |
+| Q64 | `DSH_DOCK_WELCOME_ACTION` env var? | Diagnostic-only, in the same family as `DSH_DOCK_AUTO_OPEN_HARNESS` and `DSH_DOCK_MENU_POLL_MS`. Fires the same submit path with a delay; unset by default; unrecognised values are ignored with a log line — never a wrong-channel submit. |
+| Q65 | `install-and-open` race? | **Pending-intent delivery.** Shell marks the intent before showing main; if main's page already loaded, emits immediately; else delivers on next `page load finished`. Intent cleared after emission. No new command, no new capability. |
+| Q66 | Menu on the wizard window? | **Cleared at creation** and **re-cleared after every structural rebuild** while the window exists. Guarded in `menu.rs::rebuild_menu`. |
 
 ### 8.1. Deferred to Phase 2
 
@@ -617,6 +655,7 @@ DSH-Launcher/
 - **Sidecar "no port" flash** — retry budget extension.
 - **Recent Versions submenu population.**
 - **Settings-file writer ownership** decision (Rust vs sidecar).
+- **Menu rebuilt after wizard dismissal** — currently the wizard calls `rebuild_menu(SettingsChange)` on submit; that behavior will inherit the fast-path work from §2.8.4 automatically.
 
 ### 8.2. Deferred to Phase 3.5.x
 

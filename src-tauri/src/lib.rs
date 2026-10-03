@@ -29,6 +29,7 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub mod menu;
 pub mod settings;
+pub mod welcome;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -962,6 +963,42 @@ fn close_harness_window(app: tauri::AppHandle) -> HarnessWindowState {
     HarnessWindowState { open: false, url: None }
 }
 
+/// The first-run wizard's only command (section 3.9, Pause 4).
+///
+/// `capabilities/welcome.json` grants this command - and NOTHING else - to the
+/// `welcome` window, so this is the entire surface a first-run user's window can
+/// reach. It is registered here rather than in `welcome.rs` because a Tauri
+/// command's generated permission module is keyed off the crate that declares it,
+/// and every other command in this shell is declared in this file.
+///
+/// `channel` is `Option<String>` on purpose: a dismissal passes `None` and gets
+/// `settings::DEFAULT_CHANNEL` (section 3.9: "closing without choosing defaults to
+/// `rc` and proceeds anyway"). The value is validated before anything is written,
+/// so a hand-crafted invoke cannot store a channel the rest of the launcher would
+/// refuse.
+///
+/// SYNCHRONOUS, and that is a deliberate, bounded choice: it writes one small JSON
+/// file (temp file + rename) and then marshals every window and menu operation onto
+/// the main thread. It is the same class of work the menu's channel items already
+/// do. A write failure returns `Err` and the wizard stays open with the message on
+/// screen - it must never close over a write that did not happen.
+#[tauri::command]
+fn welcome_submit(app: tauri::AppHandle, channel: Option<String>) -> Result<(), String> {
+    log_line(&format!(
+        "welcome: submit requested (channel={})",
+        channel.as_deref().unwrap_or("(dismissed)")
+    ));
+
+    welcome::submit_and_hand_off(
+        &app,
+        channel.as_deref(),
+        match channel {
+            Some(_) => welcome::SubmitReason::Submitted,
+            None => welcome::SubmitReason::Dismissed,
+        },
+    )
+}
+
 /// Where the sidecar entry point was found.
 ///
 /// Recorded rather than inferred so the log line can say which mode the launcher
@@ -1456,9 +1493,32 @@ fn spawn_window_probe(app: tauri::AppHandle) {
             let visible = describe(window.is_visible().map(|visible| visible.to_string()));
             let minimized = describe(window.is_minimized().map(|minimized| minimized.to_string()));
 
+            // DPI, and the client area expressed BOTH ways.
+            //
+            // WHY: `inner_size()` reports physical pixels, so on a scaled display
+            // the number cannot be compared with the logical sizes this project
+            // asks for - `inner_size(500, 300)` read back as `750x450` is either
+            // "correct at 150% scaling" or "half again too big", and the raw
+            // figure alone cannot tell you which. Recording the scale factor and
+            // the division makes the answer arithmetic instead of inference. This
+            // matters for macOS Retina and Linux HiDPI as much as for Windows.
+            //
+            // The configured size is named for the wizard because that is the one
+            // window whose logical size is asserted by the specification; the
+            // dashboard's comes from `tauri.conf.json`.
+            let scale = describe(window.scale_factor().map(|factor| format!("{factor}")));
+            let logical = match (window.inner_size(), window.scale_factor()) {
+                (Ok(size), Ok(factor)) if factor > 0.0 => format!(
+                    "{}x{}",
+                    (size.width as f64 / factor).round() as i64,
+                    (size.height as f64 / factor).round() as i64
+                ),
+                _ => "error".to_owned(),
+            };
+
             log_line(&format!(
-                "window probe [{label}]: hwnd={hwnd} inner={size} pos={position} \
-                 visible={visible} minimized={minimized}"
+                "window probe [{label}]: hwnd={hwnd} inner={size} logical={logical} \
+                 scale={scale} pos={position} visible={visible} minimized={minimized}"
             ));
         }
     });
@@ -1525,7 +1585,8 @@ pub fn run() {
             harness_start,
             harness_stop,
             open_harness_window,
-            close_harness_window
+            close_harness_window,
+            welcome_submit
         ])
         // Every webview page load, named. The harness window logs its own (with
         // navigation diagnostics); this covers the CONFIG window, whose URL says
@@ -1544,6 +1605,23 @@ pub fn run() {
                 webview.label(),
                 payload.url()
             ));
+
+            // C2. This hook is the ONLY place the shell learns that the dashboard
+            // can receive an event now. `main`'s page loads while the window is
+            // hidden, so a first-run hand-off would otherwise be emitted into a
+            // page that has not registered its listener yet - and be lost, which
+            // is precisely the promise the wizard makes. `mark_main_page_finished`
+            // delivers any waiting `install-and-open` payload on the next turn of
+            // the event loop.
+            //
+            // Scoped to `main`: the harness window loads a remote page we never
+            // touch, and the wizard never receives this event at all.
+            if webview.label() == MAIN_WINDOW_LABEL {
+                if let tauri::webview::PageLoadEvent::Finished = payload.event() {
+                    let webview = webview.clone();
+                    menu::mark_main_page_finished(&webview.app_handle().clone());
+                }
+            }
         })
         .setup(|app| {
             // The launcher log must exist BEFORE anything can fail, because on a
@@ -1599,6 +1677,74 @@ pub fn run() {
             menu::rebuild_menu(app.handle(), menu::RebuildReason::Initial);
             log_window_visibility(app.handle(), "after-initial-rebuild");
 
+            // FIRST-RUN GATE (section 3.9, decision Q61).
+            //
+            // The dashboard is hidden and the wizard takes its place. Tauri creates
+            // config windows - and their webviews - BEFORE `setup` runs, so `main`
+            // exists and can be hidden here with no race.
+            //
+            // WHERE THIS SITS MATTERS. It runs AFTER the initial menu rebuild, so
+            // the wizard is created by a process whose menu is already attached and
+            // `menu::clear_welcome_menu` has something to clear; and BEFORE the
+            // sidecar spawn, so the core starts exactly as it does on every other
+            // launch and the wizard is never on the critical path of the handshake.
+            //
+            // The gate only HIDES. The wizard window's creation is guarded on the
+            // same decision, because hiding the dashboard without showing the
+            // wizard would leave a first-run user with no window at all.
+            {
+                let settings = app.state::<settings::SettingsState>();
+                let decision = welcome::gate_decision(settings.first_run_completed());
+
+                log_line(&format!(
+                    "first-run gate: first_run_completed={} show_welcome={} hide_main={}",
+                    settings.first_run_completed(),
+                    decision.show_welcome,
+                    decision.hide_main
+                ));
+
+                if decision.hide_main {
+                    match app.get_webview_window(MAIN_WINDOW_LABEL) {
+                        Some(main) => match main.hide() {
+                            Ok(()) => log_line("first-run gate: the dashboard was hidden"),
+                            Err(error) => {
+                                log_line(&format!("first-run gate: could not hide the dashboard: {error}"))
+                            }
+                        },
+                        None => log_line(
+                            "first-run gate: the dashboard window does not exist, so there is \
+                             nothing to hide",
+                        ),
+                    }
+                }
+
+                if decision.show_welcome {
+                    // The pre-selection is the settings file's current channel when
+                    // it is one this build can submit, otherwise the `rc` default.
+                    let preselect = welcome::preselected_channel(&settings.snapshot());
+                    if let Err(error) = welcome::build_welcome_window(app.handle(), preselect) {
+                        // The gate already hid `main`, so a failure here would leave
+                        // the user with NO window. Bringing the dashboard back is the
+                        // only recoverable response, and it is logged as the
+                        // fallback it is.
+                        log_line(&format!(
+                            "first-run gate: FAILED to open the wizard ({error}) - showing the \
+                             dashboard instead"
+                        ));
+                        if let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                            let _ = main.show();
+                            let _ = main.set_focus();
+                        }
+                    }
+                }
+            }
+            log_window_visibility(app.handle(), "after-first-run-gate");
+
+            // Off unless DSH_DOCK_WELCOME_ACTION is set; see the note on it. Placed
+            // immediately after the gate so it can only ever act on a wizard this
+            // run actually created.
+            welcome::spawn_auto_submit_watcher(app.handle());
+
             // A failed spawn must not abort startup: the window still needs to
             // open so the failure is visible to the user rather than silent.
             if let Err(message) = spawn_sidecar(app.handle()) {
@@ -1621,7 +1767,112 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Every close request is logged. A window that disappears without
+            // C1 part A / A3. The first-run wizard is DISMISSED by its X, and
+            // section 3.9 requires that dismissal to default to `rc` and proceed
+            // anyway - so the close request is intercepted and routed to the very
+            // same hand-off the wizard's button calls. One implementation, so a
+            // click and an X cannot drift.
+            //
+            // SCOPED TO THE WIZARD, and that matters twice over: `main`'s close is
+            // how the app exits (its Destroyed handler reaps the sidecar), and the
+            // harness window's close must stay an ordinary close.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == welcome::WELCOME_WINDOW_LABEL {
+                    // THE LINE THAT MAKES THIS CLASS OF BUG OBVIOUS. Without it, the
+                    // failed acceptance run logged thousands of
+                    // `welcome CloseRequested` lines and nothing that said whether
+                    // the guard was even consulted - which is precisely the question
+                    // a reader needs answered.
+                    let in_flight = welcome::submit_in_flight();
+                    let first_run_done = window
+                        .try_state::<settings::SettingsState>()
+                        .map(|state| state.first_run_completed());
+                    log_line(&format!(
+                        "welcome: close requested (submit_in_flight={in_flight}, \
+                         first_run_completed={})",
+                        first_run_done
+                            .map(|done| done.to_string())
+                            .unwrap_or_else(|| "no-settings-state".to_owned())
+                    ));
+
+                    // A hand-off that is already running ENDS by destroying this
+                    // window. That is done with `destroy()`, which emits no event at
+                    // all, so this branch is a second line of defence rather than
+                    // the mechanism: it can only fire if a close request genuinely
+                    // arrives mid-hand-off, and then the right answer is to let it
+                    // through instead of vetoing and re-submitting.
+                    if in_flight {
+                        log_line(
+                            "welcome: close requested while a hand-off is in flight - letting it \
+                             through",
+                        );
+                        return;
+                    }
+
+                    // Vetoed before anything else: a USER's close request is a
+                    // dismissal, and it is answered by `submit_and_hand_off` rather
+                    // than by letting the platform close the window - otherwise a
+                    // failed settings write would vanish the wizard with nothing
+                    // recorded.
+                    api.prevent_close();
+                    log_line("welcome: dismissed with the window close button");
+
+                    if first_run_done == Some(true) {
+                        // Nothing is written when the first run is already recorded:
+                        // a stray X on a window that should not exist (a second
+                        // launch that raced the flag) must not rewrite the file with
+                        // the default channel and silently undo a real choice.
+                        //
+                        // DESTROY, NOT CLOSE. `close()` raises `CloseRequested`,
+                        // which lands back in this very handler and is vetoed again -
+                        // an infinite loop. That was the failure this fixes.
+                        log_line(
+                            "welcome: the first run is already recorded - destroying the wizard \
+                             without changing the channel",
+                        );
+                        if let Some(welcome_window) =
+                            window.app_handle().get_webview_window(welcome::WELCOME_WINDOW_LABEL)
+                        {
+                            if let Err(error) = welcome_window.destroy() {
+                                log_line(&format!(
+                                    "welcome: could not destroy the wizard window: {error}"
+                                ));
+                            }
+                        }
+                    } else if first_run_done == Some(false) {
+                        let handle = window.app_handle().clone();
+                        welcome::on_main(&handle, move |app| {
+                            if let Err(error) = welcome::submit_and_hand_off(
+                                app,
+                                None,
+                                welcome::SubmitReason::Dismissed,
+                            ) {
+                                log_line(&format!(
+                                    "welcome: the dismissal could not be recorded: {error} - the \
+                                     wizard stays open"
+                                ));
+                            }
+                        });
+                    } else {
+                        // No settings state at all is a broken startup, not a user
+                        // action. DESTROY rather than trap the user in a wizard whose
+                        // buttons cannot work.
+                        log_line(
+                            "welcome: no settings state is registered - destroying the wizard \
+                             without recording anything",
+                        );
+                        if let Some(welcome_window) =
+                            window.app_handle().get_webview_window(welcome::WELCOME_WINDOW_LABEL)
+                        {
+                            if let Err(error) = welcome_window.destroy() {
+                                log_line(&format!(
+                                    "welcome: could not destroy the wizard window: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }            // Every close request is logged. A window that disappears without
             // this line was not closed by us and not closed by a click, which is
             // the difference between "we hid it" and "something else did".
             if let tauri::WindowEvent::CloseRequested { .. } = event {

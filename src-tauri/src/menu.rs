@@ -35,7 +35,8 @@
 //!     nothing.
 
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -1651,6 +1652,14 @@ pub fn rebuild_menu<R: Runtime>(app: &AppHandle<R>, reason: RebuildReason) -> Re
         };
     }
 
+    // C1 part B. `AppHandle::set_menu` is app-wide and attaches to every window
+    // that has none, so this very call just handed the menu bar BACK to the
+    // first-run wizard if it is open - and the wizard deliberately has no menu
+    // (its capability grants one command, so a menu click could only ever log
+    // "could not deliver"). Clearing at creation alone would therefore survive
+    // only until the next rebuild; this is what makes it durable.
+    clear_welcome_menu(app, "rebuild");
+
     // Only now is the plan what is actually on screen.
     runtime.remember_installed(plan);
 
@@ -1700,10 +1709,186 @@ pub fn request_rebuild<R: Runtime>(app: &AppHandle<R>, reason: RebuildReason) {
 }
 
 /// Runs `work` on the main thread, from any thread.
-fn on_main<R: Runtime, F: FnOnce(&AppHandle<R>) + Send + 'static>(app: &AppHandle<R>, work: F) {
+///
+/// `pub(crate)` because the first-run wizard's hand-off runs from a command or a
+/// close handler and must marshal the same way the menu does.
+pub(crate) fn on_main<R: Runtime, F: FnOnce(&AppHandle<R>) + Send + 'static>(
+    app: &AppHandle<R>,
+    work: F,
+) {
     let handle = app.clone();
     if let Err(error) = app.run_on_main_thread(move || work(&handle)) {
         log_line(&format!("menu: could not reach the main thread: {error}"));
+    }
+}
+
+// --- The first-run wizard's window and hand-off -----------------------------
+//
+// These three live here rather than in `welcome.rs` for one reason: they are menu
+// and event-plumbing concerns, and `welcome.rs` already depends on `menu.rs`.
+// Putting them the other way round would make the two modules mutually dependent.
+// What belongs to the wizard - the options, the gate, the payload - is in
+// `welcome.rs` as pure data.
+
+/// Removes the menu bar from the first-run wizard window, if it is open.
+///
+/// WHY THE WIZARD HAS NO MENU: every window inherits the app-wide menu
+/// (`AppHandle::set_menu`), and the wizard's capability grants exactly one command.
+/// A `Stop Harness` or `Settings…` click from that window could therefore only log
+/// "could not deliver" - a poor first impression, on the one screen a brand-new
+/// user sees. Section 2.9's durable surfaces are the dashboard and the harness
+/// window; the wizard is neither.
+///
+/// Called from TWO places, which is why it is a function rather than an inline
+/// call: at creation (the initial rebuild happened before the wizard existed, so
+/// nothing else would cover it) and at the end of every rebuild (which re-attaches
+/// the menu to every window that has none). One helper, so the two cannot drift.
+pub(crate) fn clear_welcome_menu<R: Runtime>(app: &AppHandle<R>, stage: &str) {
+    let Some(window) = app.get_webview_window(crate::welcome::WELCOME_WINDOW_LABEL) else {
+        return;
+    };
+
+    // An EMPTY menu is the platform's "no menu bar" for this window; there is no
+    // `set_menu(None)` shape on a window in tauri 2.
+    let empty = match Menu::new(app) {
+        Ok(menu) => menu,
+        Err(error) => {
+            log_line(&format!(
+                "welcome: could not build an empty menu for the wizard window ({stage}): {error}"
+            ));
+            return;
+        }
+    };
+
+    // `set_menu` returns the menu it REPLACED (`Some` when the window had one),
+    // not a unit. The value is discarded on purpose: the app-wide menu is owned by
+    // `rebuild_menu` and must not be restored from here.
+    match window.set_menu(empty) {
+        Ok(_) => log_line(&format!("welcome: menu cleared on the wizard window ({stage})")),
+        Err(error) => log_line(&format!(
+            "welcome: could not clear the wizard window's menu ({stage}): {error}"
+        )),
+    }
+}
+
+/// Whether `main`'s page has finished loading, and any hand-off not yet delivered.
+///
+/// STATIC RATHER THAN MANAGED STATE, deliberately: `on_page_load` is registered on
+/// the `Builder` and its very first invocation can happen BEFORE the `setup` hook
+/// runs, so anything `setup` manages would not exist yet. A `OnceLock` is created
+/// on first use from whichever thread gets there first and needs no ordering
+/// guarantee at all.
+struct MainPageState {
+    /// Set once `main`'s page load has finished at least once.
+    finished: AtomicBool,
+    /// The `install-and-open` payload awaiting delivery, if any.
+    pending: Mutex<Option<crate::welcome::InstallAndOpenPayload>>,
+}
+
+static MAIN_PAGE_STATE: OnceLock<MainPageState> = OnceLock::new();
+
+/// The process-wide [`MainPageState`], created on first use.
+fn main_page_state() -> &'static MainPageState {
+    MAIN_PAGE_STATE.get_or_init(|| MainPageState {
+        finished: AtomicBool::new(false),
+        pending: Mutex::new(None),
+    })
+}
+
+/// Records that `main` finished a page load, and delivers any waiting hand-off.
+///
+/// Called from the app-wide `on_page_load` hook for the `main` window only. The
+/// payload is delivered on a LATER turn of the event loop rather than inline:
+/// `Finished` fires when the document is complete, and the dashboard's listener is
+/// registered by its Svelte `onMount`, which runs as part of that same document's
+/// script evaluation. Posting the emit means the listener wins the race even when
+/// the two are microseconds apart.
+pub(crate) fn mark_main_page_finished<R: Runtime>(app: &AppHandle<R>) {
+    main_page_state()
+        .finished
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Queued, not inline: see the note above. `on_main` clones the handle itself.
+    on_main(app, deliver_pending_install_and_open);
+}
+/// Arms the hand-off and delivers it as soon as `main` can receive it (C2).
+///
+/// WHY THIS EXISTS AT ALL: `main` is created during startup and its page loads
+/// while the window is HIDDEN, so by the time a human answers the wizard the page
+/// may or may not be listening. Emitting blind would, on a genuine first run,
+/// silently lose the one thing the wizard promised - and the user would be looking
+/// at a stopped dashboard wondering why "Install and Open Harness" did nothing.
+///
+/// The intent is therefore stored, delivered immediately when the page is known to
+/// have finished loading, and otherwise delivered from
+/// [`mark_main_page_finished`]. The stored intent is CLEARED once the emit
+/// succeeds, so a later page load cannot re-fire a hand-off the user already
+/// received.
+pub(crate) fn arm_install_and_open<R: Runtime>(
+    app: &AppHandle<R>,
+    payload: crate::welcome::InstallAndOpenPayload,
+) {
+    let state = main_page_state();
+    {
+        let mut pending = state.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        // A second arm replaces the first rather than queueing: the wizard can only
+        // complete once, and two hand-offs would start the harness twice.
+        *pending = Some(payload);
+    }
+
+    if state.finished.load(std::sync::atomic::Ordering::SeqCst) {
+        deliver_pending_install_and_open(app);
+    } else {
+        log_line(
+            "welcome: the dashboard page has not finished loading - the install-and-open \
+             hand-off will be delivered when it does",
+        );
+    }
+}
+
+/// Emits the stored hand-off, exactly once, if it is ready to be delivered.
+fn deliver_pending_install_and_open<R: Runtime>(app: &AppHandle<R>) {
+    let state = main_page_state();
+
+    if !state.finished.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
+    let Some(payload) = state
+        .pending
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    else {
+        // The normal case: nothing is waiting. Silent on purpose - this runs on
+        // every page load.
+        return;
+    };
+
+    // The same question `deliver` asks, for the same reason: the dashboard is the
+    // action surface, but the launcher keeps running when `main` is closed. An
+    // undeliverable action is reported, never swallowed.
+    if app.get_webview_window(MAIN_WINDOW_LABEL).is_none() {
+        log_line(
+            "welcome: could not deliver 'install-and-open' - the control panel is not open",
+        );
+        return;
+    }
+
+    match app.emit_to(MAIN_WINDOW_LABEL, crate::welcome::EVENT_INSTALL_AND_OPEN, &payload) {
+        Ok(()) => log_line(&format!(
+            "welcome: install-and-open delivered (channel={} dismissed={})",
+            payload.channel, payload.dismissed
+        )),
+        Err(error) => {
+            // Put it back: a failed emit is exactly the case the pending slot
+            // exists for, and it will be retried at the next page load.
+            log_line(&format!(
+                "welcome: could not emit {}: {error} - it will be retried",
+                crate::welcome::EVENT_INSTALL_AND_OPEN
+            ));
+            *state.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(payload);
+        }
     }
 }
 
@@ -3153,10 +3338,16 @@ mod tests {
         // The regression this guards: the menu used to call the sidecar itself,
         // so a menu "Stop Harness" left the dashboard showing a running harness.
         // Each of these ids must resolve to an action that only EMITS.
+        //
+        // OpenLogsFolder is the deliberate exception (section 3.8, Q58): it has no
+        // dashboard state to keep in step, so the shell reveals the folder itself.
+        // That makes it a worker action, and asserting "no I/O" on it here would
+        // contradict `needs_worker` and the dispatcher. Its worker classification
+        // is asserted by the sibling test for the two-worker set; this test covers
+        // the actions that are forwarded ONLY.
         for (id, expected) in [
             (ID_HARNESS_RESTART, DashboardAction::Restart),
             (ID_HARNESS_STOP, DashboardAction::Stop),
-            (ID_HARNESS_OPEN_LOGS, DashboardAction::OpenLogs),
         ] {
             let action = MenuAction::from_id(id).expect("a known id");
             assert!(

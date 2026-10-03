@@ -5,6 +5,8 @@
   // Plain JS on purpose: the retry policy is the part worth testing, and this
   // keeps it runnable under `node` with no browser and no test framework.
   import { CONNECT_PHASE, connectToSidecar } from "./lib/sidecar-connection.js";
+  import Welcome from "./lib/Welcome.svelte";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
 
   // The launcher dashboard. All launcher logic lives in the Node sidecar; this
   // component only renders what the shell reports and calls commands.
@@ -13,6 +15,14 @@
   // http://127.0.0.1:<sidecar-port>/harness/status would require CORS headers on
   // the sidecar and would bypass Tauri's capability system. The three commands
   // proxy that traffic instead (Phase 1 decision).
+  //
+  // TWO WINDOWS, ONE BUNDLE. `main.ts` mounts this one component tree for every
+  // window, so the label decides what renders. The first-run wizard window is
+  // granted exactly ONE command (`capabilities/welcome.json`), so the dashboard's
+  // calls must not run there: `onMount` returns before it does anything when the
+  // label is not `main`, and the markup below renders `Welcome` instead.
+  const WINDOW_LABEL = getCurrentWindow().label;
+  const IS_MAIN_WINDOW = WINDOW_LABEL === "main";
 
   /** Mirrors sidecar/lib/control.js's status payload. */
   interface HarnessStatus {
@@ -55,6 +65,16 @@
   let elapsed = 0;
   /** True only during the first-load handshake, before any error is warranted. */
   let connecting = true;
+  /**
+   * True while "Install and Open Harness" is waiting for a boot to finish.
+   *
+   * Set by `installAndOpen()` and honoured by `refresh()`, which opens the harness
+   * window the moment the status reaches `running`. This is what makes the wizard's
+   * button OPEN the harness rather than merely start it - a cold first install takes
+   * minutes, so a one-shot "start, then open" would open a window at a URL the
+   * harness was not serving yet.
+   */
+  let pendingOpen = false;
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -124,6 +144,14 @@
         stopTimers();
         // A stop closes the harness window from the shell side, so mirror that.
         if (next.status !== "running") harnessWindowOpen = false;
+      }
+
+      // The wizard's hand-off: "Install and Open Harness" is not finished until
+      // the harness window is actually showing, and that cannot happen until the
+      // harness reports a URL.
+      if (pendingOpen && next.status === "running") {
+        pendingOpen = false;
+        await openHarness();
       }
     } catch (error) {
       shellError = String(error);
@@ -280,14 +308,78 @@
     }
   }
 
+  /**
+   * The first-run wizard's hand-off: install the harness, then open it.
+   *
+   * WHY THIS IS NOT A SECOND IMPLEMENTATION OF "START": it routes to the same
+   * `startHarness` the button uses, and the opening is done by `refresh`, which is
+   * already the one place that knows the harness's status. The only new fact is
+   * `pendingOpen`.
+   *
+   * THE THREE CASES (approved design, C2):
+   *   running  -> open now; there is nothing to install
+   *   starting -> wait; `refresh` opens it when the boot finishes
+   *   stopped  -> start, then wait
+   *
+   * The `refresh()` first is deliberate: the shell delivers this event when the
+   * dashboard can receive it, which can be several seconds after the harness state
+   * last changed. Acting on a stale local `status` could start a harness that is
+   * already running.
+   */
+  async function installAndOpen() {
+    await refresh();
+
+    if (status?.status === "running") {
+      await openHarness();
+      return;
+    }
+
+    if (status?.status !== "starting") {
+      pendingOpen = true;
+      await startHarness();
+      return;
+    }
+
+    // Already booting - most likely adopted from a previous session, or started by
+    // the menu. Just wait for it.
+    pendingOpen = true;
+    startPolling();
+  }
+
   onMount(() => {
+    // THE WIZARD WINDOW MUST NOT RUN ANY OF THIS. `capabilities/welcome.json`
+    // grants the `welcome` window exactly one command, so an `invoke` from here
+    // would be rejected - and a rejected call on a first run is a bad first
+    // impression, not a diagnosable error. Returning before anything is scheduled
+    // is what keeps the two windows honest.
+    if (!IS_MAIN_WINDOW) return;
+
     void initialRefresh();
+
     const menuActions = listen<{ action?: string }>("menu:action", (event) => {
       runMenuAction(event.payload?.action ?? "");
     });
+
+    /**
+     * The wizard's hand-off. Delivered by the shell once this page can receive it,
+     * with `{ channel, dismissed }`.
+     *
+     * The payload is currently informational - the channel is already in
+     * `settings.json` by the time this arrives, and the install follows the
+     * settings, not this event. It is logged through the same channel as every
+     * other launcher event so a first run is followable from the console.
+     */
+    const installAndOpenEvent = listen<{ channel?: string; dismissed?: boolean }>(
+      "install-and-open",
+      () => {
+        void installAndOpen();
+      },
+    );
+
     return () => {
       stopTimers();
       void menuActions.then((unlisten) => unlisten());
+      void installAndOpenEvent.then((unlisten) => unlisten());
     };
   });
 
@@ -298,6 +390,11 @@
   }
 </script>
 
+<!-- One bundle, two windows. The wizard's window renders the wizard and nothing
+     else; every other window renders the dashboard. -->
+{#if !IS_MAIN_WINDOW}
+  <Welcome />
+{:else}
 <main>
   <header>
     <h1>DSH-Dock</h1>
@@ -393,6 +490,7 @@
     Closing this window leaves the harness running.
   </footer>
 </main>
+{/if}
 
 <style>
   main {

@@ -16,8 +16,8 @@
 // here has no permission identifier, so granting it in a capability is a build
 // error - which is the safe direction to fail in. (Phase 0 did not need this
 // because `capabilities/default.json` granted no app commands; the harness
-// window's capability grants none by design, and the main window now grants
-// exactly these six.)
+// window's capability grants none by design; the main window grants six; and the
+// first-run wizard grants exactly one, `welcome_submit`.)
 
 fn main() {
     tauri_build::try_build(
@@ -35,6 +35,10 @@ fn main() {
                 // can call nothing.
                 "open_harness_window",
                 "close_harness_window",
+                // Pause 4: the first-run wizard's ONLY command. Declared so
+                // `allow-welcome-submit` exists for capabilities/welcome.json, which
+                // grants it to the `welcome` window and nothing else.
+                "welcome_submit",
             ]),
         ),
     )

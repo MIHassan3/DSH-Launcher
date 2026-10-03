@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "welcome-window",
+  "description": "Scopes the first-run wizard window. Grants ONE command and nothing else.",
+  "windows": ["welcome"],
+  "permissions": ["core:default", "allow-welcome-submit"]
+}

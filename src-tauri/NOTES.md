@@ -281,6 +281,209 @@ running. Two implementations of "stop" had drifted apart.
   bring the panel forward. Only the settings write and the logs opener need a
   worker thread; everything else is an event emission or window management.
 
+## The first-run wizard (Pause 4)
+
+Section 3.9. On a first run the dashboard is **hidden** and a small window takes its
+place; answering it writes the channel and `first_run_completed = true` in one
+atomic write and hands the user to the dashboard with the harness starting.
+
+### The gate
+
+`setup` runs `welcome::gate_decision(settings.first_run_completed())`, which returns
+`{show_welcome, hide_main}` and whose two flags are always equal **by design**:
+hiding the dashboard without creating the wizard would leave a brand-new user with
+no window at all. The block sits after the initial menu rebuild (so the wizard is
+created by a process whose menu already exists, giving `clear_welcome_menu`
+something to clear) and before the sidecar spawn (so the core starts identically to
+every other launch and the wizard is never on the handshake's critical path).
+
+The release binary's log should show, on a first run:
+
+```
+[shell] first-run gate: first_run_completed=False show_welcome=true hide_main=true
+[shell] window check [after-first-run-gate]: main=visible:false welcome=visible:true
+```
+
+and on every later launch:
+
+```
+[shell] first-run gate: first_run_completed=True show_welcome=false hide_main=false
+```
+
+### The wizard window has no menu bar (two-part guard)
+
+Every window inherits the app-wide menu, and the wizard's capability grants exactly
+one command, so a menu there could only ever log `could not deliver`. It is cleared
+in **two** places, through one helper (`menu::clear_welcome_menu`):
+
+1. **At creation.** The initial `rebuild_menu` ran *before* the wizard existed, so
+   nothing else covers the first-run case.
+2. **At the end of every rebuild.** `AppHandle::set_menu` re-attaches the menu to
+   every window that has none, so a single clear at creation would survive only
+   until the next rebuild. This is what makes it durable - it future-proofs against
+   Phase 2's background check firing a rebuild while the wizard is open.
+
+`window.set_menu(Menu::new())` is the "no menu bar" shape; there is no
+`set_menu(None)` on a window in tauri 2.
+
+### One submit path, and the in-flight guard
+
+`welcome::submit_and_hand_off` is called by **three** entry points and is the only
+thing that writes:
+
+| Entry point | `requested` | reason |
+| :--- | :--- | :--- |
+| `welcome_submit(channel)` — the button | the channel | `submitted` |
+| the window's X (`CloseRequested`, vetoed) | `None` | `dismissed` |
+| `DSH_DOCK_WELCOME_ACTION` (diagnostic) | parsed value | `submitted` / `dismissed` |
+
+**The X is the reason `SUBMIT_IN_FLIGHT` exists.** The hand-off *ends by closing the
+wizard window*, and closing a window produces a `CloseRequested` event - which
+`lib.rs` intercepts so that the X counts as a dismissal. Without the guard those
+compose into a regress: the handler vetoes the close (so `close()` never takes
+effect), submits again, which closes again, and the wizard sits on screen with the
+app apparently frozen. The rule is one hand-off at a time; a close that arrives
+while one is in flight is **allowed through** rather than vetoed. No unit test can
+see this - it is a property of the event loop - which is why the acceptance script
+drives the real path.
+
+A failed write returns `Err`, the wizard **stays open** and shows the message
+inline. It is never closed over a write that did not happen: a wizard that vanished
+with nothing recorded would simply reappear next launch with no explanation.
+
+### Delivering `install-and-open` reliably (why there is a pending slot)
+
+`main`'s page loads while the window is **hidden**, so at the moment the wizard is
+answered its listener may not be registered - and a lost event on a genuine first
+run means the user sees a stopped dashboard wondering why "Install and Open
+Harness" did nothing.
+
+So the hand-off is an intent with a delivery point, not a blind emit:
+
+1. `menu::arm_install_and_open` stores the payload and emits immediately **if**
+   `main`'s page is known to have finished loading.
+2. Otherwise it waits for the app-wide `on_page_load` hook to report
+   `PageLoadEvent::Finished` for `main` (`menu::mark_main_page_finished`).
+3. Delivery is posted to a later turn of the event loop, because `Finished` fires
+   when the document completes while the listener is registered by Svelte's
+   `onMount` during that same document's evaluation.
+4. The stored intent is **cleared once the emit succeeds**, so a later page load
+   cannot re-fire a hand-off the user already received. A failed emit puts it back
+   for the next load.
+
+The dashboard side is `install-and-open` → refresh, then: `running` → open now;
+`starting` → wait; `stopped` → run the **same** `startHarness` its own button runs,
+with `pendingOpen` making `refresh` open the harness window when the boot finishes.
+One implementation of "start", and "Install and **Open**" is honoured for a cold
+install that takes minutes.
+
+`DSH_DOCK_AUTO_OPEN_HARNESS` is unaffected: it checks `harness_window_open` before
+acting, and it is a separate diagnostic from this path.
+
+### `DSH_DOCK_WELCOME_ACTION` (diagnostic only)
+
+WebView2 exposes no accessibility tree here, so the wizard's controls **cannot be
+clicked programmatically**. Without a hook, the install-and-open hand-off - the one
+behaviour that matters most on a first run - would be reachable only by a human
+click and could not be asserted at all.
+
+```
+$env:DSH_DOCK_WELCOME_ACTION = "alpha"     # rc | alpha | all | dismiss
+```
+
+- It is a **trigger, never a second code path**: it calls `submit_and_hand_off`.
+- It is a **timer** (a plain thread that sleeps 3s), never a subprocess.
+- **Fail-safe:** anything that is not one of `rc`, `alpha`, `all` or `dismiss` is
+  logged and **ignored** - the wizard stays open exactly as if the variable were
+  unset:
+
+  ```
+  [shell] welcome: DSH_DOCK_WELCOME_ACTION='xyz' not recognised; ignoring. Valid: rc, alpha, all, dismiss
+  ```
+
+  A stray exported variable must never produce a wrong first run. Falling back to
+  `rc` would write a channel the user never chose; leaving the wizard open is the
+  only outcome that cannot be wrong.
+- Unset, empty and `0` all mean "off", matching `DSH_DOCK_DUMP_MENU_PLAN`.
+- Set on a launch that is **not** a first run, it logs and does nothing.
+
+### Window size: inner, not outer — and the probe reports PHYSICAL pixels
+
+`inner_size(500, 300)` sets the **client area** in logical pixels, so the window on
+screen is about 39 logical pixels taller once the title bar is added. Section 3.9
+says "approximately 500×300" without saying which box; this is the client area, and
+`welcome::WELCOME_INNER_SIZE` is the one place it is defined.
+
+**`window probe` reports `inner=` in PHYSICAL pixels.** On a 150%-scaled display the
+wizard therefore logs `inner=750x450`, and the dashboard logs `inner=1650x1050`
+against its configured `1100x720`. That is correct behaviour, not an oversized
+window - but a raw `750x450` cannot be told apart from a wizard that really is half
+again too big, so the probe line carries the arithmetic:
+
+```
+[shell] window probe [welcome]: hwnd=590962 inner=750x450 logical=500x300 scale=1.5 \
+        pos=574,316 visible=true minimized=false
+```
+
+`logical=` is `inner=` divided by `scale=`, so "the client area is the 500×300 the
+spec asks for" is a subtraction rather than an inference. This is also what makes
+macOS Retina and Linux HiDPI checkable rather than guesswork: the raw pixel count
+differs per display, the logical figure does not.
+
+### The recorded channel does not yet change what is installed
+
+**Nothing in `sidecar/` reads `auto_update_channel` as of this build.** The wizard
+persists the choice - in one atomic write, which is the point of doing it now - and
+Phase 2 makes it load-bearing. A future reader should not assume that picking Alpha
+in the wizard changes what "Install and Open Harness" downloads today.
+
+### `build.rs` must declare the command
+
+Tauri v2 does **not** auto-discover app commands. `build.rs` keeps an explicit
+`AppManifest::new().commands(&[…])` list, and a command missing from it has no
+`allow-<name>` permission - so granting it in a capability is a hard build failure:
+
+```
+Permission allow-welcome-submit not found, expected one of allow-close-harness-window, …
+```
+
+`welcome_submit` is therefore in `build.rs` as well as in `invoke_handler`. Keep the
+two in sync. The generated `permissions/autogenerated/welcome_submit.toml` is build
+output; never edit it.
+
+### Acceptance: `test/welcome-check.ps1`
+
+```powershell
+cargo build --manifest-path "src-tauri/Cargo.toml" --release
+powershell -NoProfile -File src-tauri/test/welcome-check.ps1
+```
+
+Five cases against the **release** binary (section 7.4: no dev server), each with a
+fresh `DSH_DOCK_DATA_DIR` under `%TEMP%`:
+
+1. env var unset → wizard visible, dashboard **hidden**, no auto-submit, nothing
+   written;
+2. `=alpha` → hand-off delivered, `settings.json` records `alpha` +
+   `first_run_completed`, wizard closes, dashboard returns, and a **second launch**
+   on the same data dir goes straight to the dashboard;
+3. `=dismiss` → the `rc` default is recorded (`dismissed=true`);
+4. `=xyz` → the rejection is logged and the wizard **stays open** with nothing
+   written - the case that stops a broken hook from making the others pass;
+5. plus the menu-clearing and probe lines from case 1.
+
+It never touches `%LOCALAPPDATA%\DSH-Dock` and removes every directory it created
+(`-KeepArtifacts` to inspect instead). `Remove-SafeDir` refuses any path outside
+`%TEMP%`. The ~5 minute npm install a real first run would trigger is **not**
+exercised - that belongs to Phase 2's testing; these cases assert the hand-off and
+the settings only.
+
+### Future concern: `.gitattributes` and CRLF
+
+`core.autocrlf=true` with no `.gitattributes`, while every tracked source file is
+LF-only. Nothing is broken today, but a `git add -A` with that setting in play could
+rewrite line endings across the tree and bury a real diff in noise. A
+`.gitattributes` decision belongs in a later revision or Phase 2 prep.
+
 ## Shutting the sidecar down
 
 `stop_sidecar` logs its outcome (`the sidecar was terminated` / `could not
