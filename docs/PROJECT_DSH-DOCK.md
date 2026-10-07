@@ -1,8 +1,8 @@
 # DSH-Dock: A Unified Framework for a Professional DeepSeek Harness Launcher
 
-**Document Version:** 2.6.0
-**Last Updated:** 2026-10-03
-**Status:** Pause 4 complete — Phase 2 ready to begin
+**Document Version:** 2.7.0
+**Last Updated:** 2026-10-07
+**Status:** Phase 2A complete (version library foundation, backend). Phase 2B next.
 
 ---
 
@@ -144,7 +144,7 @@ These are non-obvious behaviors discovered during development. They must be resp
 
 **Port discovery on Windows.** `Get-NetTCPConnection -LocalPort` does not detect IPv6-only listeners. Use `netstat -ano` or an actual TCP connect.
 
-**Orphaned dev processes.** Cancelling a `cargo tauri dev` job does not kill grandchild processes. Both `node.exe` (sidecars and harnesses) and `msedgewebview2.exe` processes survive job termination. Phase 2 will address via Windows Job Objects.
+**Orphaned dev processes.** Cancelling a `cargo tauri dev` job does not kill grandchild processes. Both `node.exe` (sidecars and harnesses) and `msedgewebview2.exe` processes survive job termination. **Phase 2A research (Step 3):** libuv creates a Windows Job Object per Node process with `KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK`. Non-detached children join that job (the sidecar); detached children (the harness, spawned with `detached: true`) escape by design. **Consequence:** the sidecar already dies with the launcher, and the harness already survives — the orphans observed in testing were non-detached test children that the test kill didn't follow. **2D is now a "decide and document" step, not a "build native code" step.** See §8.1.
 
 **`custom-protocol` feature is mandatory for release builds.** `src-tauri/Cargo.toml` must declare:
 
@@ -276,13 +276,15 @@ Native menus don't support text inputs, sliders, or dropdown selectors. Complex 
 
 **Note on spec drift:** earlier versions of this document referenced a `latest-rc` dist-tag that does not exist. The implementation resolves "latest RC" via `next` → `latest` → **hard failure** (never a silent alpha fallback). The MD retains the historical reference for continuity; the code is authoritative.
 
-**First run:** downloads the latest **Stable** and the latest **Alpha** (two versions, not three). RC is opt-in from the Version Manager.
+**First run:** downloads exactly one version — the channel the user selected in the first-run wizard (`rc`, `alpha`, or `all`). No second version is pre-downloaded. Additional channels are opt-in from the Version Manager (Phase 2B).
 
 **On-demand:** the user can download any specific version from the Version Manager, in the background, with progress indicators.
 
 **Background caching:** periodic NPM registry polling (see §3.2). New releases are pre-downloaded automatically, bounded by a user-configurable limit (default 10 versions).
 
 **Populating the library:** `npm install --prefix <version-dir> --cache <data-dir>/.npm-cache --no-audit --no-fund @deepseek-ai/dsh@<exact>`.
+
+**Install staging (settled in Phase 2A):** the npm prefix is a sibling staging directory `<versions>/.staging-<version>-<nonce>`, not the final version directory. Validation runs against the staging tree; on success, an atomic rename lands it at `<versions>/<version>`. **Confirmed working with real npm on Windows.** The final path therefore only ever exists in a validated state. An in-place install with a `.incomplete` marker exists as an environmental fallback and is not the production path.
 
 - Path layout: `<data-dir>\versions\<version>\node_modules\@deepseek-ai\dsh\lib\bin.js`.
 - Switching repoints to that `bin.js`. No reinstall, no copy.
@@ -474,12 +476,11 @@ Current fields:
 
 Both the native menu bar and the web settings window read from and write to this file. Neither caches state across sessions. Whoever changes a setting last wins, and both surfaces reflect the current state on open.
 
-**Two writers:** the Rust shell and the Node sidecar both write this file. Safeguards:
+**Two writers, with a Phase 2A convention.** Both the Rust shell and the Node sidecar write this file. Safeguards:
 - Atomic replace (temp file + rename).
 - Unknown-key preservation (fields the writer doesn't know about survive a rewrite).
 - Single shared `data_dir()` resolver used by both the settings writer and `launcher_log_path()`.
-
-**Long-term ownership** (which side owns the file) is a Phase 2 decision.
+- **Writer-ownership convention (finalized in Phase 2A):** the sidecar owns *its own* settings writes (update-check timestamps, ETag, cache-management state). The shell owns writes that originate from a UI action (channel selection, `first_run_completed`). Both writers use the same atomic-replace + unknown-key-preservation contract, so interleaved writes cannot corrupt the file. There is no single-owner lock — the write pattern is safe by construction.
 
 ### 3.12. Explicit Non-Goals for v1.0
 
@@ -501,7 +502,7 @@ Both the native menu bar and the web settings window read from and write to this
 | **v0.5.1 fix** | ✅ Complete 2026-09-14 | Installer packaging fix. | Sidecar bundled, install/data dirs separated, restore call disabled. |
 | **Pause 3: Menu Bar + First-Run Wiring** | ✅ Complete 2026-10-02 | Native menu bar + settings plumbing + fast-path update. | 1. `menu.rs` with Harness/Dock/Settings. ✅ <br> 2. Menu items route to dashboard handlers. ✅ <br> 3. `settings.rs` with atomic writes + unknown-key preservation. ✅ <br> 4. Status-label fast path (0 ms vs 37 ms rebuild). ✅ <br> 5. Cross-platform verification (Windows only; macOS/Linux deferred). ✅ |
 | **Pause 4: First-Run Wizard** | ✅ Complete 2026-10-03 | Welcome window + channel selection + install-and-open. | 1. `welcome.rs` + `Welcome.svelte`. ✅ <br> 2. `welcome_submit` command + capability. ✅ <br> 3. `install-and-open` event with pending-intent delivery. ✅ <br> 4. First-run gate in `setup`. ✅ <br> 5. Menu cleared on wizard window. ✅ <br> 6. Wizard destroyed via `destroy()` (not `close()`). ✅ <br> 7. Acceptance script `welcome-check.ps1` — 29/29. ✅ |
-| **Phase 2: Version Library & Dynamic Port** | 3 weeks | Multi-version management. | 1. Library directory structure generalized. <br> 2. Multi-version download. <br> 3. Version switching in the UI. <br> 4. Storage management prompts. <br> 5. `MIN_SUPPORTED_DSH` derived from evidence. <br> 6. Job Object for orphan prevention. <br> 7. Install tree validation after npm install. |
+| **Phase 2: Version Library & Dynamic Port** | 3 weeks | Multi-version management. **Split into four sub-phases (2A–2D).** | **2A (Version Library Foundation, backend) — ✅ Complete 2026-10-07.** <br> **2B (Version Switch + Registry Routes + Minimal UI)** — next. <br> **2C (Background Updates + Storage Management)** — deferred. <br> **2D (Job Object + Hardening)** — reframed to "decide and document" per the libuv finding; see §8.1. |
 | **Phase 3: Settings & Update UI** | 3 weeks | Full settings surface. | 1. Version Manager table UI. <br> 2. Update Preferences UI. <br> 3. Background check + notification system. <br> 4. Tauri v2 Updater integration. <br> 5. Channel selection and pinning UI. |
 | **Phase 4: Polish & Release** | 2 weeks | v1.0.0. | 1. System tray. <br> 2. Cross-platform builds. <br> 3. Bundled Node runtime. <br> 4. Docs + SECURITY.md. <br> 5. `--remap-path-prefix`. <br> 6. v1.0.0 release. |
 
@@ -538,6 +539,28 @@ Both the native menu bar and the web settings window read from and write to this
 
 **Verified:** `cargo test` 161/161, clippy clean, `svelte-check` 0/0. Acceptance script 29/29. X-button dismissal verified by hand.
 
+### 4.3. Phase 2A Deliverables — Version Library Foundation (Backend)
+
+**New:**
+- `sidecar/lib/library.js` — version library abstraction: enumeration, containment (`isPathInsideVersions`), `isVersionDirName`, `resolvesToSamePath`, `planDelete`, `deleteVersion`, `deletePartialVersion`, `selectVersionsToDelete`.
+- `sidecar/lib/catalogue.js` — launcher-owned advisory catalogue (`<versions>/catalogue.json`). Wrapper-object schema (`{schemaVersion, updatedAt, versions}`), `readCatalogue`, `writeCatalogue` (temp + rename), `recordInstall`, `removeEntry`, `catalogueHealth`, `checksumFor`. Corrupt catalogues are quarantined to `.corrupt-<timestamp>`, never deleted.
+- `sidecar/lib/validation.js` — `validateInstallTree(installDir, {checkMarker})`, structured `{ok, problems: [{code, path, detail}]}` with distinct codes: `bin-missing`, `dsh-package-missing`, `web-app-missing`, `package-json-unreadable`.
+- `sidecar/lib/library-lock.js` — `<versions>/.lock` via `fs.openSync(..., "wx")`. Stale after 10 min. Released in `finally`. Serializes library mutations (install, delete).
+- Test suites: `sidecar/test/library.js`, `catalogue.js`, `install-flow.js`, `library-delete.js`, `library-select.js`, `library-live.js`, plus `library-probe.js` (a probe script, not a counted suite).
+
+**Modified:**
+- `sidecar/lib/harness-install.js` — parameterized `installVersion(version, opts)`; staged-rename install with in-place fallback; force-reinstall moves the old tree aside and restores on failure; `runNpm`'s `env` option now merged over `process.env` (was silently dropped); `isSafeVersionName` tightened to reject dist-tags and ranges.
+- `sidecar/test/harness-install.js` — updated for the new install flags.
+- `sidecar/test/lib/fake-npm.js` — extended for the staged-rename flow.
+- `src-tauri/NOTES.md` — Phase 2A section (12 subsections, 587→706 lines).
+
+**Verified:**
+- 1100/1100 offline checks across 11 suites.
+- 42/42 live checks against real npm — `0.2.0-rc.1` (161.9 s) and `0.2.0-rc.2` (63.9 s, warm cache) installed into a `%TEMP%` data dir.
+- **`approach: "staged"` for both live installs.** The `--prefix` staging question is settled: real npm on Windows populates the sibling staging prefix, validation passes there, and the atomic rename lands. The in-place fallback stays an environmental safety net and does not become the production path.
+- Force-install of the running version refuses with a specific error; the target tree byte-identical before and after.
+- Cross-process lock acquisition verified for both install and delete.
+
 ---
 
 ## 5. Repository Layout
@@ -572,7 +595,14 @@ DSH-Launcher/
 │   ├── Cargo.toml
 │   ├── tauri.conf.json
 │   └── NOTES.md
-├── sidecar/                     # unchanged from v0.5.1
+├── sidecar/
+│   ├── lib/
+│   │   ├── catalogue.js         # launcher-owned advisory catalogue
+│   │   ├── harness-install.js   # parameterized install + staged rename
+│   │   ├── library-lock.js      # <versions>/.lock
+│   │   ├── library.js           # version library abstraction
+│   │   └── validation.js        # install-tree validation
+│   └── test/                    # 11 offline suites + library-live.js + library-probe.js
 ├── legacy/
 └── package.json
 ```
@@ -646,16 +676,32 @@ DSH-Launcher/
 | Q64 | `DSH_DOCK_WELCOME_ACTION` env var? | Diagnostic-only, in the same family as `DSH_DOCK_AUTO_OPEN_HARNESS` and `DSH_DOCK_MENU_POLL_MS`. Fires the same submit path with a delay; unset by default; unrecognised values are ignored with a log line — never a wrong-channel submit. |
 | Q65 | `install-and-open` race? | **Pending-intent delivery.** Shell marks the intent before showing main; if main's page already loaded, emits immediately; else delivers on next `page load finished`. Intent cleared after emission. No new command, no new capability. |
 | Q66 | Menu on the wizard window? | **Cleared at creation** and **re-cleared after every structural rebuild** while the window exists. Guarded in `menu.rs::rebuild_menu`. |
+| Q67 | Catalogue authority? | **Advisory only.** Filesystem enumeration is ground truth; the catalogue accelerates ordering and accounting. Missing or unparseable catalogue degrades to filesystem-only enumeration. `installDir` stored relative to library root; the authoritative path is derived from the validated version name. |
+| Q68 | Staged install vs. in-place? | **Staged.** npm prefix into `<versions>/.staging-<version>-<nonce>`; validate; atomic rename to `<versions>/<version>`. Confirmed working with real npm on Windows (Phase 2A Step 5). In-place with `.incomplete` marker remains a fallback and is not the production path. |
+| Q69 | `.incomplete` marker semantics? | **Fallback-only.** Written before npm runs, deleted after validation succeeds. `listInstalledVersions` treats any directory containing `.incomplete` as `partial` regardless of `bin.js`. `validateInstallTree` has a `checkMarker` mode flag: `true` for enumeration (complete *and* finished?), `false` for the installer (complete?). |
+| Q70 | Running-version force-install guard? | **Refuse before any write.** Shared path-identity check (`resolvesToSamePath`) between install-with-force and delete. Fail-fast message: `Refusing to overwrite the running version <V>; stop the harness or choose another version.` Target tree byte-identical before and after a refused operation. |
+| Q71 | Cross-module rule pinning? | **Any rule stated in two modules must be pinned by a test that compares them, not by tests that check each in isolation.** Established after `isSafeVersionName` (Step 3) and `isVersionDirName` (Step 4) drifted. Applies beyond the version-name case. |
+| Q72 | libuv Job Object finding? | **Recorded.** libuv creates a Windows Job Object per Node process with `KILL_ON_JOB_CLOSE \| SILENT_BREAKAWAY_OK`. Non-detached children join (sidecar); detached children escape (harness). The harness's survival across launcher death is by design. 2D is reframed from "build a Job Object" to "decide and document what happens to a force-killed launcher's detached harness." |
 
-### 8.1. Deferred to Phase 2
+### 8.1. Phase 2 Deferred Items — Status After 2A
 
-- **Windows Job Object** for orphan prevention (sidecar + harness + WebView2).
-- **`MIN_SUPPORTED_DSH`** value derived from real install + boot + switch testing.
-- **Install tree validation** after `npm install`.
+**Completed in 2A:**
+- **Install tree validation** after `npm install` — `validation.js` plus the staged-rename install path.
+- **Settings-file writer ownership** — finalized: sidecar owns its own writes, shell owns UI-originated writes; atomic-replace + unknown-key-preservation make interleaving safe (see §3.11).
+
+**Still open — moved to 2B:**
+- **`MIN_SUPPORTED_DSH`** — value to be set from real install + boot + **switch** testing. 2A's live install produced the evidence base (two versions coexist, both validated); 2B's switch operation produces the final evidence.
+- **`isInstalled` → `isInstalledAndValid` rewire** — deferred from 2A. One caller today (`control.js`'s start path). The rewire belongs where the switch flow can test it end-to-end.
+- **Recent Versions submenu population** — up to 5 recent versions by date, plus "Show all versions…" (`SHOW_ALL_VERSIONS_ENABLED`).
+
+**Still open — moved to 2C:**
 - **Sidecar "no port" flash** — retry budget extension.
-- **Recent Versions submenu population.**
-- **Settings-file writer ownership** decision (Rust vs sidecar).
-- **Menu rebuilt after wizard dismissal** — currently the wizard calls `rebuild_menu(SettingsChange)` on submit; that behavior will inherit the fast-path work from §2.8.4 automatically.
+- **Background version check** (12h cadence, ETag-aware).
+- **Storage management prompts** and `cache_limit` enforcement.
+- **Menu rebuilt after wizard dismissal** — inherits the §2.8.4 fast-path work automatically.
+
+**Still open — moved to 2D:**
+- **Windows Job Object** — reframed from "build native code" to "decide and document" after the Phase 2A Step 3 libuv finding. The sidecar already dies with the launcher's libuv job; the harness already escapes via `SILENT_BREAKAWAY_OK` and survives by design. **The 2D question is:** what should happen to a detached harness when the launcher is force-killed? The current behavior (adopt/reap on next launch, §2.3) is arguably correct. 2D's deliverable is to **decide**, **document**, and **add a test** proving the launcher's force-kill does not orphan the sidecar.
 
 ### 8.2. Deferred to Phase 3.5.x
 
@@ -665,6 +711,24 @@ DSH-Launcher/
 ### 8.3. Deferred to Phase 4
 
 - **`--remap-path-prefix`**, **bundled Node runtime**, **MSI installer**, **code signing**.
+
+### 8.4. Deferred to Phase 5 / Post-1.0 — Harness-First Launch
+
+**Current behavior:** launching DSH-Dock opens the dashboard window; the user clicks Start, then Open Harness, then closes the dashboard. Friction for the common case.
+
+**Target behavior:**
+1. User launches DSH-Dock.
+2. First run → wizard appears → harness starts.
+3. Subsequent runs → the harness window opens directly (starting the harness if not already running). The dashboard is **not shown** on the common path.
+4. The dashboard becomes an "advanced" surface — reachable via a menu item ("Show Control Panel"), tray icon (Phase 4), or keyboard shortcut.
+
+**What this requires before it can ship:**
+- The menu bar needs the dashboard's remaining buttons: **Start**, **Open Harness**, **Close Harness Window**, **Refresh**. The current menu has Restart, Stop, Open Logs — but not these four.
+- A new setting `launch_behavior: "harness" | "dashboard"` (default `"harness"`).
+- The tray icon (Phase 4) becomes the "always-present" access point for the dashboard.
+- The dashboard may eventually become a modal or side panel opened on demand, rather than a first-class window.
+
+**Rationale:** recorded here so Phase 3 and Phase 4 design decisions respect it. Not a Phase 2 concern — it does not affect 2A's backend work or 2B's version-switching scope.
 
 ---
 
