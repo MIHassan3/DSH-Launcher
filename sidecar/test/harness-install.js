@@ -287,10 +287,26 @@ await report.section("installVersion failure branches (stub npm)", async () => {
       (error?.message ?? "").includes("bin.js"),
       error?.message,
     );
+    // STEP 3 CHANGED THIS ASSERTION, DELIBERATELY. Until Step 3 the only
+    // post-npm check was `existsSync(binPath)`, and its message guessed at a
+    // changed package layout. Phase 2's validation now reports EVERY missing
+    // entry with its path, so the message no longer speculates - it names what is
+    // absent and why the harness would fail at boot. The old wording is gone on
+    // purpose; `missingPaths` is the machine-readable form of the same fact.
     report.check(
-      "the missing-entry-point message suggests a layout change",
-      /layout/i.test(error?.message ?? ""),
+      "the failure names every missing path structurally",
+      Array.isArray(error?.missingPaths) && error.missingPaths.some((p) => p.includes("bin.js")),
+      JSON.stringify(error?.missingPaths),
+    );
+    report.check(
+      "the failure explains the boot symptom the check exists to prevent",
+      /ERR_MODULE_NOT_FOUND/.test(error?.message ?? ""),
       error?.message,
+    );
+    report.check(
+      "the failure names its step",
+      error?.step === "validate",
+      error?.step,
     );
   });
 
@@ -336,7 +352,18 @@ await report.section("installVersion failure branches (stub npm)", async () => {
 await report.section("successful install and idempotence (stub npm)", async () => {
   const version = "8.8.8-fake";
 
-  const result = await withEnv({ FAKE_NPM_MODE: "ok", FAKE_NPM_MAKE_BIN: "1" }, () =>
+  // All three MAKE_* flags: since Step 3 the install is not complete until the
+  // tree VALIDATES, so the stub must produce the entry point, the harness
+  // manifest and the web-app package. `FAKE_NPM_MAKE_BIN=1` alone is now a
+  // deliberately-incomplete tree, which the section above relies on.
+  const complete = {
+    FAKE_NPM_MODE: "ok",
+    FAKE_NPM_MAKE_BIN: "1",
+    FAKE_NPM_MAKE_MANIFEST: "1",
+    FAKE_NPM_MAKE_WEB_APP: "1",
+  };
+
+  const result = await withEnv(complete, () =>
     install.installVersion(version, { paths: PATHS, ...fakeNpm() }),
   );
 
@@ -345,19 +372,30 @@ await report.section("successful install and idempotence (stub npm)", async () =
   report.check("binPath is the harness entry point", result.binPath === install.harnessBinPath(result.installDir));
   report.check("bin.js now exists on disk", fs.existsSync(result.binPath), result.binPath);
   report.check("isInstalled now agrees", install.isInstalled(version, { paths: PATHS }) === true);
+  report.check(
+    "the result reports which install approach landed",
+    result.approach === install.INSTALL_APPROACH.STAGED,
+    String(result.approach),
+  );
+  report.check(
+    "no staging directory is left behind after a successful staged install",
+    fs.readdirSync(PATHS.versions).some((entry) => entry.startsWith(".staging-")) === false,
+    JSON.stringify(fs.readdirSync(PATHS.versions)),
+  );
 
-  const second = await withEnv({ FAKE_NPM_MODE: "ok", FAKE_NPM_MAKE_BIN: "1" }, () =>
+  const second = await withEnv(complete, () =>
     install.installVersion(version, { paths: PATHS, ...fakeNpm() }),
   );
   report.check("a second install short-circuits (fast path)", second.skipped === true);
   report.check("the short circuit reports the same binPath", second.binPath === result.binPath);
 
-  const forced = await withEnv({ FAKE_NPM_MODE: "ok", FAKE_NPM_MAKE_BIN: "1" }, () =>
+  const forced = await withEnv(complete, () =>
     install.installVersion(version, { paths: PATHS, ...fakeNpm(), force: true }),
   );
   report.check("force re-runs npm", forced.skipped === false);
+  report.check("force still leaves a valid tree", install.isInstalled(version, { paths: PATHS }) === true);
 
-  const tagRecorded = await withEnv({ FAKE_NPM_MODE: "ok", FAKE_NPM_MAKE_BIN: "1" }, () =>
+  const tagRecorded = await withEnv(complete, () =>
     install.installVersion(version, { paths: PATHS, ...fakeNpm(), force: true, tag: "next" }),
   );
   report.check("the satisfying dist-tag is recorded on the result", tagRecorded.tag === "next", tagRecorded.tag);

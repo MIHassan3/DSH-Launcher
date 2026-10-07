@@ -585,3 +585,319 @@ If `window probe` reports no handle, the menu is not the suspect and neither is
 the Rust code - check the two integrity labels above. If it reports a real handle,
 a real size and `visible=true`, the window exists, and any remaining complaint is
 about menu content or clicks.
+
+---
+
+# Phase 2A: the version library (backend)
+
+Everything in this section is `sidecar/` only. No UI, no menu, no Tauri command, no
+registry polling and no Job Object work happens in Phase 2A - those are 2B, 2C and
+2D. The phase exists to make `<data-dir>/versions/` hold **N versions cleanly** and
+to make an install verifiable rather than merely finished.
+
+## The module split, and why it is four files
+
+| Module | Owns |
+| :--- | :--- |
+| `library.js` | Enumeration, the three states, path containment, path identity, deletion, cache-limit candidate selection |
+| `validation.js` | "Is this tree complete?" - pure filesystem checks, structured problem codes |
+| `catalogue.js` | The advisory `versions/catalogue.json` index: dates, sources, checksums |
+| `library-lock.js` | The advisory `<versions>/.lock` that serializes library mutations |
+
+The split is by QUESTION, not by layer. A single `versions.js` was rejected because
+the four questions have different failure semantics: validation must never throw,
+the catalogue must never be authoritative, the lock must never be permanently
+unacquirable, and only `library.js` may destroy anything.
+
+`version-manager.js` was deliberately NOT converted into this module or into a
+directory. It stays what it already was - a constants home (`HARNESS_PACKAGE`,
+`DEFAULT_VERSION_LIMIT`, `CHANNELS`) - so Phase 2A did not churn every import for
+no functional gain.
+
+## The three-state model: `installed` / `partial` / `absent`
+
+`readLibraryEntry(version)` returns exactly one of:
+
+- **`installed`** - the directory exists AND the tree validates. The only state that
+  means "this can be run".
+- **`partial`** - the directory exists but the tree does not validate, or it carries
+  an `.incomplete` marker. This is what an interrupted install leaves behind.
+- **`absent`** - no directory.
+
+Three states rather than two because "not here" and "here and broken" need
+completely different UI and completely different repair, and before Phase 2A nothing
+in the codebase could tell them apart. `partialInstallDirs()` reports the leftovers
+(staging directories, marker-bearing directories, quarantined catalogues) and
+`listReadyVersions()` filters to the runnable ones.
+
+**Ordering is deterministic**: primary key `installedAt` descending (section 3.8's
+"recent versions by date"), versions with no catalogue entry after the dated ones,
+then version-string descending. An unordered list feeding a menu is a bug that shows
+up as a reshuffling menu.
+
+## The catalogue is ADVISORY. The filesystem is the ground truth.
+
+`<data-dir>/versions/catalogue.json`:
+
+```json
+{ "schemaVersion": 1, "updatedAt": "<iso>", "versions": {
+    "<version>": { "installedAt": "<iso>", "source": "next", "installDir": "<version>",
+                   "checksum": "sha256:<64 hex>", "validatedAt": "<iso>",
+                   "package": "@deepseek-ai/dsh" } } }
+```
+
+Four rules, each pinned by a test, each of which makes the file impossible to
+mistake for a source of truth:
+
+1. **A version on disk with no entry is still installed.** Enumeration reads the
+   filesystem; the catalogue only supplies dates.
+2. **An entry with no version on disk is ignored.** The install directory is derived
+   from the *validated version name*, never from the stored string, so a hand-edited
+   entry cannot redirect a delete, a switch or an enumeration.
+3. **A missing, corrupt, oversized or newer-schema catalogue degrades to
+   filesystem-only enumeration.** A corrupt file is MOVED aside to
+   `.corrupt-<timestamp>` (never deleted - it may be the only record of what the
+   library held) and the library still enumerates.
+4. **A catalogue write failure never fails an install.** By the time it is written
+   the version is on disk and validated; the result reports
+   `catalogue: "recorded" | "unrecorded (reason)"` and the install stays successful.
+
+`installDir` is stored **relative to the library root**: an absolute path is
+machine-specific, and copying a data directory to another drive would otherwise
+leave every entry pointing somewhere that no longer exists.
+
+`checksum` is sha256 of `node_modules/@deepseek-ai/dsh/package.json` - small, stable
+in content, and enough to catch a truncated or substituted install. It is NOT a
+whole-tree hash: hashing a full install is hundreds of megabytes and must never run
+during enumeration (`checksums: true` opts in, and the live report uses it).
+
+`listInstalledVersions` does not read the catalogue at all. Dates arrive through an
+`installedAt` map the caller passes in (`catalogue.readInstalledAt()`), which is why
+the advisory guarantee is structural rather than a discipline.
+
+## Installs: staged rename, with an in-place fallback
+
+`installVersion(version, options)` installs into
+`<versions>/.staging-<version>-<nonce>` - a **sibling** of the target, so the rename
+can never cross a volume boundary - validates there, and only then renames onto
+`<versions>/<version>`.
+
+**The invariant: the final path only ever appears in a validated state.**
+
+A tree that fails validation ABORTS (a second npm run with the same flags produces
+the same broken tree, so falling back would only double a large download). The
+fallback exists for **environmental** failures - npm not populating the staging
+prefix, or the rename not landing - because installing in place is a genuinely
+different attempt. `approach: "staged" | "in-place"` and `fallbackReason` are
+reported on every result, so a silent downgrade is impossible.
+
+`fs.renameSync` cannot replace an existing directory on this platform, so a `force`
+reinstall moves the old tree aside to `.staging-<version>-replaced-<ts>`, installs,
+then removes the backup. If the final rename fails the backup is **renamed back**, so
+a failed reinstall is never how a user loses a version. That restore branch is
+covered by an injected-rename test (`options.rename` is a test-only seam; a real
+`EPERM`/`EXDEV` cannot be provoked inside one temp directory).
+
+**Live confirmation (2026, Phase 2A Step 5).** Two real published versions
+(`0.2.0-rc.1`, `0.2.0-rc.2`) were installed with real npm on Windows:
+`approach=staged` for both, ~162s and ~64s, no staging leftovers, and a library root
+containing exactly the two version directories plus `catalogue.json`. **The
+`--prefix` staging question is settled: npm honours a sibling staging prefix on
+Windows**, and the in-place fallback is a safety net rather than the production path.
+
+Two incidental findings from the same run:
+
+- The harness package itself is small (**~74 KB unpacked, 20 files**); the ~370 MB /
+  543 packages is its **dependency tree**. First-run cost estimates should quote the
+  tree, not the package.
+- `npm --prefix <dir>` writes its own `package.json` and `package-lock.json` into
+  `<dir>`, alongside `node_modules`. Both are harmless artifacts inside a version
+  directory. Because the staged form is what now runs, nothing lands in the library
+  root.
+- `@deepseek-ai/dsh-web-app` is a declared runtime dependency of `@deepseek-ai/dsh`
+  and npm **hoists it to a sibling of `dsh`** in `node_modules/@deepseek-ai/`. The
+  validation resolver checks the hoisted location first and the npm conflict layout
+  (`dsh/node_modules/@deepseek-ai/...`) second, so both layouts validate.
+
+## The `.incomplete` marker (fallback-only)
+
+The in-place path writes `<versions>/<version>/.incomplete` **before** npm runs and
+deletes it **only after validation passes**. `listInstalledVersions` treats any
+directory carrying it as `partial` regardless of whether `bin.js` exists - which
+matters, because a stale `bin.js` from an earlier attempt otherwise makes a marked
+directory look installable.
+
+The marker is never written on the staged path. On a failed install: a directory this
+attempt CREATED is removed entirely (so "the target is absent" reliably means "not
+installed"), while a directory that pre-existed keeps its content and its marker.
+
+`validateInstallTree` therefore takes `checkMarker`:
+
+- `true` (default) - "is this complete AND finished?". What `library.js` asks.
+- `false` - "is this complete?". What the in-place installer must ask, because it
+  plants the marker itself. The first in-place install failed on its own bookkeeping
+  before this split existed.
+
+## Guards: the running version cannot be overwritten or deleted
+
+`installVersion(..., {force: true})` and `deleteVersion()` both refuse the version the
+recorded harness is running from, with the same sentence:
+
+```
+Refusing to overwrite the running version <V>; stop the harness or choose another version.
+Refusing to delete the running version <V>; stop the harness or choose another version.
+```
+
+Both route through one predicate, `library.resolvesToSamePath`, because two guards
+that disagreed about "the same path" would let one fire and not the other, and the
+failure mode is destroying the tree the user is working in. It handles trailing
+separators, separator flavour, Windows casing, `.`/`..`, and `realpathSync` for 8.3
+names and symlinks.
+
+Why the guard exists at all: on Windows, renaming over - or deleting - a running
+process's tree fails with `EPERM`/`EBUSY`, which is self-protecting but arrives after
+minutes of npm work with a useless message. The guard converts it into a refusal
+before anything is touched. A **non-forced** install of an already-installed version
+still short-circuits rather than refusing, so the section 3.3 fast path is intact.
+
+## Deletion
+
+`deleteVersion` runs every guard before any mutation: exact-version name (dist-tags
+and ranges are refused, not treated as absent), containment computed from the
+validated name, the running-version check, and the `.incomplete` marker. It takes the
+same library lock installs use, around the `rmSync` and the catalogue removal -
+concurrent install+delete would otherwise both rewrite `catalogue.json`.
+
+- **`dryRun` takes no lock and removes nothing**, and returns file/directory/byte
+  counts. That is the seam 2C's storage prompt calls: section 3.1 requires that
+  exceeding the cache limit PROMPTS, never silently evicts.
+- **`deletePartialVersion`** is the explicit cleanup for a marked or broken tree - a
+  thin wrapper over one implementation, so the guards cannot drift. It still refuses
+  the running version: "this tree is broken" is not a licence to delete the harness
+  that is serving.
+- **`selectVersionsToDelete`** produces prompt CANDIDATES and deletes nothing -
+  partial installs first, then oldest first, never the running or pinned version. The
+  "prompt, never silently evict" rule is expressed as code that structurally cannot
+  evict.
+
+## The library lock
+
+`<versions>/.lock`, created with `fs.openSync(..., "wx")` - exclusive creation, atomic
+on NTFS and POSIX, so there is no read-then-write race in acquire. Stale after 15
+minutes (the install budget is 10, so the timeout fires first), or immediately if the
+recorded pid is gone. Release checks ownership first, so a process whose stale lock was
+taken over never deletes the new holder's lock.
+
+`withLock` is async-aware. A helper that released when the body returned its *promise*
+would drop the lock at the start of the work.
+
+The honest limit: this is an advisory lock against the launcher's own processes and a
+cooperative operator. It is not a security boundary and a determined external writer
+can ignore it.
+
+## Two lessons that cost real debugging time
+
+**A rule stated in two modules must be pinned by a test that compares them.**
+`isSafeVersionName` exists in both `library.js` and `harness-install.js`. In Step 3 the
+install module's copy was tightened to reject dist-tags, and the library's copy was
+not. The consequence was not a crash: `deleteVersion("next")` would have reported
+`not-installed` instead of refusing - a *plausible, silent, wrong answer* that 2B's tag
+resolution could have fed into a delete path. Step 4 also lost `isVersionDirName` the
+same way. The fix is a test (`sidecar/test/library.js`) that runs one accept/refuse
+list through both modules and asserts they agree on every case. Testing each module
+against its own expectations does not catch a divergence.
+
+**A guard chain must never throw; it must refuse.** `planDelete` and
+`runningVersionInfo` both called `installDirFor`, which throws for a name that cannot
+be a directory - so `deleteVersion("../../evil")` crashed instead of returning a
+refusal with a reason. The first guard in every chain is now "can this even be a
+version?", and the "unsafe" path returns a result rather than raising.
+
+Two smaller traps that produced confusing symptoms:
+
+- **An `async` function's throw is a rejected promise, not a synchronous throw.** A
+  test that called `installVersion` without `await` inside `try`/`catch` never caught
+  anything AND left a real install running in the background holding the library lock,
+  which then failed every later section of that file. If `install-flow.js` ever shows a
+  flaky "lock is held" symptom, look for a missing `await` first.
+- **`import()` needs `pathToFileURL` on Windows.** A bare drive-letter specifier fails
+  with `ERR_UNSUPPORTED_ESM_URL_SCHEME: Received protocol 'c:'`. Any test that spawns a
+  Node child which imports a module by absolute path must convert it first.
+
+## The libuv Job Object finding (this changes Phase 2D)
+
+Section 8.1 deferred "Windows Job Object for orphan prevention" to Phase 2. The
+research says the mechanism already exists and the deferral's premise was wrong.
+From libuv's Windows spawn implementation (`deps/uv/src/win/process.c`), which Node
+uses for every `child_process` spawn:
+
+1. libuv creates a **per-process job object** on the first non-detached spawn, with
+   `JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK |
+   JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`,
+   and assigns the Node process itself to it.
+2. Every **non-detached** child is assigned to that job. A **detached** child is not -
+   and libuv's comment explicitly declines to set `CREATE_BREAKAWAY_FROM_JOB`, because
+   that flag makes `CreateProcess` FAIL when the process is already inside a job that
+   disallows breakaway.
+3. `SILENT_BREAKAWAY_OK` is what makes the detached harness survive: a process already
+   inside a job may create children that are not placed in that job when the job allows
+   silent breakaway, which libuv always sets.
+
+Consequences for this project:
+
+- **The sidecar already dies with the launcher.** It is a non-detached child of the
+  launcher, whose libuv job has `KILL_ON_JOB_CLOSE`. No new code is needed for that.
+- **The harness already survives the launcher, by design** - that is exactly what makes
+  section 2.3's adopt/reap work, and it is libuv's behavioural guarantee, not luck.
+- **`CREATE_BREAKAWAY_FROM_JOB` is therefore unnecessary**, and using it would be
+  riskier than doing nothing: it fails outright under a restrictive outer job.
+- Node's `child_process` cannot create or assign a job of its own (libuv asserts its
+  flag set is limited to `DETACHED`, `SETUID`/`SETGID`,
+  `WINDOWS_FILE_PATH_EXACT_NAME`, `WINDOWS_HIDE*`, `VERBATIM_ARGUMENTS`). If the
+  sidecar ever needs its own job, that requires a native addon - colliding with Phase
+  4's "bundled Node runtime, no compile step" - or launcher-side spawning, which breaks
+  the thin-shell rule.
+
+So 2D is **"decide and document", not "build native code"**: when the launcher is
+force-killed and the harness survives by design, is that correct? The current answer is
+yes - the next launch's adopt/reap either reuses it or reaps it - and what 2D owes is a
+recorded decision plus a test proving the launcher's force-kill does not orphan the
+*sidecar*. The orphans actually observed in Pause 3/4 testing were sidecars left by
+force-killed **test** runs, not harnesses.
+
+## Tests, and the `RUN_LIVE=1` gate
+
+All offline suites are dependency-free scripts run directly (`node sidecar/test/<file>.js`),
+matching the existing convention - no framework, no `node:test`, no new packages:
+
+| Suite | Covers |
+| :--- | :--- |
+| `library.js` | Names, containment, the three states, ordering, leftovers, and the cross-module version-name pin |
+| `catalogue.js` | Round-trip, corruption and quarantine, write failures, the advisory guarantee |
+| `install-flow.js` | Staged rename, the fallback, the marker, the running guard, the lock (incl. cross-process) |
+| `library-delete.js` | Every refusal, dry run, real delete, the backup-restore path, cross-process locking |
+| `library-select.js` | Cache-limit candidate selection (pure, deletes nothing) |
+| `library-probe.js` | Read-only diagnostic: prints the library the way the launcher sees it |
+
+**`sidecar/test/library-live.js` is the network tier and is opt-in.** It is gated by
+`RUN_LIVE=1` (the Phase 2 plan's name); `DSH_DOCK_TEST_INSTALL=1` is also accepted,
+because that is the existing sidecar convention and silently skipping an
+explicitly-requested ~12-minute network test is the more expensive mistake. It
+installs **two** real versions, because one proves an install and two prove the library
+actually holds N.
+
+```powershell
+$env:RUN_LIVE='1'; node sidecar/test/library-live.js
+$env:RUN_LIVE='1'; $env:DSH_DOCK_LIVE_VERSIONS='0.2.0-rc.1,0.2.0-rc.2'; node sidecar/test/library-live.js
+```
+
+**It refuses to run unless the data directory is under a temp root and NOT under
+`%LOCALAPPDATA%`.** That is checked before any import that could resolve a path,
+because the user's live install is `%LOCALAPPDATA%\DSH-Dock\` and is running the
+session. `DSH_DOCK_LIVE_DATA` overrides the default (`<repo>/.test-tmp/library-live`),
+which is PRESERVED after a run for inspection. npm's cache is redirected inside the data
+directory with `--cache`, so the user's global npm cache is never touched.
+
+A re-run against a preserved library asserts the **fast path** instead of the install,
+because both versions are then already present - the first version of that loop
+asserted "it installed" unconditionally and failed on a correct re-run.
