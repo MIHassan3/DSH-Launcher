@@ -454,6 +454,172 @@ await report.section("install tree validation", () => {
   );
 });
 
+await report.section("the cheap probe answers the SAME question, only cheaper", () => {
+  // THE CROSS-MODULE PIN (Q71), AND THE ONE THAT MATTERS MOST IN 2B.
+  //
+  // Two predicates answer "can this version be run?": the strict one reads every
+  // required manifest, the cheap one only `stat`s entries. The status list uses the
+  // cheap one; the start path uses the strict one. If they disagree, the UI offers
+  // a version that is then silently reinstalled - or refuses one that works.
+  //
+  // This walks EVERY fixture, including the interesting partial cases the real-tree
+  // probe cannot cover (a missing web-app, an unparseable manifest, a directory
+  // where bin.js belongs). One divergence is allowed and named below.
+  const strictOnlyCodes = new Set([
+    validation.PROBLEM.PACKAGE_JSON_INVALID,
+    validation.PROBLEM.PACKAGE_JSON_UNREADABLE,
+  ]);
+
+  const disagreements = [];
+  const expectedCheapOnly = [];
+
+  for (const version of library.scanLibraryRoot({ paths: PATHS }).versions) {
+    const cheap = library.readLibraryEntry(version, { paths: PATHS, validate: false }).state;
+    const strictEntry = library.readLibraryEntry(version, { paths: PATHS });
+    if (cheap === strictEntry.state) continue;
+
+    // The ONE allowed divergence, and it must be in the SAFE direction: a tree
+    // whose only problem is an unparseable or unreadable manifest reads
+    // `installed` cheaply (the entry is present) and `partial` strictly. Safe
+    // because the strict check is the one that gates a start.
+    const codes = strictEntry.problems.map((problem) => problem.code);
+    const onlyManifestProblem = codes.length > 0 && codes.every((code) => strictOnlyCodes.has(code));
+    if (cheap === library.LIBRARY_STATE.INSTALLED && onlyManifestProblem) {
+      expectedCheapOnly.push(version);
+      continue;
+    }
+    disagreements.push(`${version}: cheap=${cheap} strict=${strictEntry.state} codes=${JSON.stringify(codes)}`);
+  }
+
+  report.check(
+    "every fixture agrees except the documented manifest case",
+    disagreements.length === 0,
+    disagreements.join(" | "),
+  );
+  report.check(
+    "the manifest case is the only divergence, and it errs toward `installed` (the safe direction)",
+    expectedCheapOnly.sort().join(",") === "0.1.0,0.1.1",
+    expectedCheapOnly.sort().join(","),
+  );
+
+  // The specific case that motivated the shared predicate: bin.js present, web-app
+  // absent. This is the over-approximation that would have shipped.
+  report.check(
+    "the missing-web-app fixture really is missing its web-app",
+    fs.existsSync(path.join(VERSIONS, "0.1.2", "node_modules", "@deepseek-ai", "dsh-web-app")) === false,
+  );
+  report.check(
+    "the cheap probe calls a tree with no web-app PARTIAL",
+    library.readLibraryEntry("0.1.2", { paths: PATHS, validate: false }).state === library.LIBRARY_STATE.PARTIAL,
+    library.readLibraryEntry("0.1.2", { paths: PATHS, validate: false }).state,
+  );
+  report.check(
+    "while the historical isInstalled check still says yes - the gap that used to exist",
+    install.isInstalled("0.1.2", { paths: PATHS }) === true,
+  );
+
+  // The marker stays decisive on the cheap path.
+  const marked = library.readLibraryEntry("0.1.4", { paths: PATHS, validate: false });
+  report.check("the marked fixture really is marked, with a bin.js present", marked.hasIncompleteMarker === true && marked.hasBin === true);
+  report.check("the cheap probe reports it PARTIAL", marked.state === library.LIBRARY_STATE.PARTIAL, marked.state);
+  report.check("the cheap path does not invent problems it never collected", marked.problems.length === 0);
+
+  // The predicate itself, so a failure above names the right module.
+  report.check("hasRequiredEntries accepts a complete tree", validation.hasRequiredEntries(path.join(VERSIONS, "0.2.0-rc.2")) === true);
+  report.check("hasRequiredEntries rejects the marked tree", validation.hasRequiredEntries(path.join(VERSIONS, "0.1.4")) === false);
+  report.check("hasRequiredEntries rejects the no-bin tree", validation.hasRequiredEntries(path.join(VERSIONS, "0.1.3")) === false);
+  report.check(
+    "installTreeEssentials names WHICH package is missing, not merely that one is",
+    validation.installTreeEssentials(path.join(VERSIONS, "0.1.2")).missingPackages.join(",") === "@deepseek-ai/dsh-web-app",
+    JSON.stringify(validation.installTreeEssentials(path.join(VERSIONS, "0.1.2")).missingPackages),
+  );
+});
+
+await report.section("the SHELL's version predicate is a subset of the library's (Q71 across the wire)", () => {
+  // THE AUTHORITY IS HERE; THE SHELL'S COPY IS A GATE. Phase 2B added
+  // `is_switchable_version` to `src-tauri/src/menu.rs`, because a malformed menu id
+  // must never become an HTTP request and the user deserves a reason rather than a
+  // 400 from a service they did not know was involved.
+  //
+  // The relation that must hold is a SUBSET, not equality:
+  //
+  //   shell accepts   =>  library accepts       (required: a dispatched route is valid)
+  //   library accepts =/=>  shell accepts       (allowed: the shell may be stricter)
+  //
+  // The second is deliberate and narrow - the shell refuses the empty dot-separated
+  // identifiers the library's pattern tolerates - and it is safe because its only
+  // consequence is a refusal the user can see, never a bad request.
+  //
+  // The corpus below is a COPY of the shell test's corpus. It cannot be shared across
+  // the language boundary, so it is duplicated on purpose: a version added to one list
+  // and not the other is exactly the drift this pair exists to catch.
+  const shellAccepts = [
+    "0.2.0-rc.1",
+    "0.2.0-rc.2",
+    "0.2.1-alpha.1",
+    "1.2.3",
+    "1.2.3-alpha.10",
+    "1.2.3+build.5",
+    "1.2.3-rc.1+build.5",
+    "0.0.1-rc.1",
+    "10.20.30",
+  ];
+  const shellRefuses = [
+    "../../evil",
+    "1.0.0/../evil",
+    "next",
+    "latest",
+    "1.x",
+    "^1.2.3",
+    "1.2",
+    "1.2.3.4",
+    "1.2.3-",
+    "1.2.3+",
+    "1.2.3 ",
+    "1.2.3-rc.1+",
+    "v1.2.3",
+  ];
+
+  const violations = shellAccepts
+    .filter((version) => !library.isSafeVersionName(version))
+    .map((version) => `${version}: the shell would dispatch it, the library would refuse it`);
+  report.check(
+    "every version the shell would dispatch is one the library accepts",
+    violations.length === 0,
+    violations.join(" | "),
+  );
+
+  // The other direction, so "subset" is actually tested and not assumed: everything
+  // the shell refuses must ALSO be refused here, or the shell would be refusing
+  // versions the rest of the launcher considers valid.
+  const disagreements = shellRefuses
+    .filter((version) => library.isSafeVersionName(version))
+    .map((version) => `${version}: the shell refuses it but the library accepts it`);
+  report.check(
+    "every version the shell refuses is one the library refuses too",
+    disagreements.length === 0,
+    disagreements.join(" | "),
+  );
+
+  // And the corpus is not vacuous in either direction.
+  report.check(
+    "the accepted corpus is really accepted, so the subset check is not trivially true",
+    shellAccepts.every((version) => library.isSafeVersionName(version)),
+  );
+  report.check(
+    "the refused corpus is really refused, so the agreement check is not trivially true",
+    shellRefuses.every((version) => !library.isSafeVersionName(version)),
+  );
+
+  // ON THE DIRECTION NOT PROVEN HERE. The relation required of the shell is a subset:
+  // anything it dispatches must be valid. The shell's predicate is stricter by
+  // construction (it refuses the empty dot-separated identifiers that the library's
+  // pattern would need a concrete example to demonstrate), and NOTHING in this corpus
+  // distinguishes them - the two agree on every string above. Rather than assert a
+  // divergence with an invented example, this records the honest position: they agree
+  // on everything tested, and the shell may only ever refuse MORE.
+});
+
 await report.section("harness-install delegating helpers (additive, no behavior change)", () => {
   const good = path.join(VERSIONS, "0.2.0-rc.2");
   report.check(
@@ -625,13 +791,25 @@ await report.section("single-version reads", () => {
     "an absent version reads as absent",
     library.readLibraryEntry("7.7.7", { paths: PATHS }).state === library.LIBRARY_STATE.ABSENT,
   );
+  // PHASE 2B CORRECTED THIS ASSERTION. It used to read "the cheap probe
+  // (validate:false) calls a bin-only tree installed" and required INSTALLED for
+  // `0.1.2` - a tree with `bin.js` but NO `dsh-web-app`. That pinned the bug: the
+  // cheap probe was asked a different question from the strict one, so the status
+  // list offered a version the start path then refused and silently reinstalled.
+  // The cheap probe now asks the shared predicate, and a tree missing a required
+  // package is PARTIAL on both paths.
   report.check(
-    "the cheap probe (validate:false) calls a bin-only tree installed",
-    library.readLibraryEntry("0.1.2", { paths: PATHS, validate: false }).state === library.LIBRARY_STATE.INSTALLED,
+    "the cheap probe (validate:false) calls a tree with no web-app partial",
+    library.readLibraryEntry("0.1.2", { paths: PATHS, validate: false }).state === library.LIBRARY_STATE.PARTIAL,
+    library.readLibraryEntry("0.1.2", { paths: PATHS, validate: false }).state,
   );
   report.check(
     "the cheap probe still calls a bin-less tree partial",
     library.readLibraryEntry("0.1.3", { paths: PATHS, validate: false }).state === library.LIBRARY_STATE.PARTIAL,
+  );
+  report.check(
+    "and it calls a complete tree installed",
+    library.readLibraryEntry("0.2.0-rc.2", { paths: PATHS, validate: false }).state === library.LIBRARY_STATE.INSTALLED,
   );
   report.check(
     "isInstalledInLibrary matches the state field",

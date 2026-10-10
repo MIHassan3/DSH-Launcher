@@ -5,7 +5,16 @@
   // Plain JS on purpose: the retry policy is the part worth testing, and this
   // keeps it runnable under `node` with no browser and no test framework.
   import { CONNECT_PHASE, connectToSidecar } from "./lib/sidecar-connection.js";
+  // The cadence decisions live in a plain-JS module so they can be tested under
+  // `node`: both Phase 2B stale-state bugs were in WHEN to poll, not in the polling.
+  import { HARNESS_ACTIVE_POLL_MS, harnessPollMs } from "./lib/version-refresh.js";
   import Welcome from "./lib/Welcome.svelte";
+  // The minimal version manager (Phase 2B). It owns its own data fetching, because
+  // the version library changes on a different cadence from the harness status: a
+  // job's progress is polled at 500ms while work runs and NOT AT ALL when idle, and
+  // the registry listing is fetched on mount and after a job finishes. Folding that
+  // into this component's status loop would poll the registry forever.
+  import VersionManager from "./lib/VersionManager.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   // The launcher dashboard. All launcher logic lives in the Node sidecar; this
@@ -55,7 +64,6 @@
     shellError: string | null;
   }
 
-  const POLL_MS = 500;
 
   let status: HarnessStatus | null = null;
   let shellError: string | null = null;
@@ -76,8 +84,19 @@
    */
   let pendingOpen = false;
 
+  /**
+   * A message the shell asked the dashboard to show, from `panel:open`.
+   *
+   * The switch outcome arrives this way (Q74/Q80). It is rendered beside the version
+   * manager rather than in the harness card, because it is a VERSION operation's
+   * result and that is where the user was looking.
+   */
+  let panelMessage: string | null = null;
+
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
+  /** The cadence the current `pollTimer` runs at, so a switch can detect a change. */
+  let pollIntervalMs = 0;
 
   /**
    * Normalizes a shell response into either a status or a visible error.
@@ -114,21 +133,69 @@
   }
 
   /**
-   * Polls while a start is in flight.
+   * Stops only the elapsed-seconds ticker. The status poll keeps running.
    *
-   * A cold first boot can take minutes, so the UI shows elapsed time rather than
-   * an unexplained spinner. Polling stops as soon as the state is terminal.
+   * The two timers have DIFFERENT lifetimes and were once conflated: the ticker only
+   * means anything while a boot is in flight, while the poll is the only way this
+   * window can learn the harness changed.
    */
-  function startPolling() {
-    if (pollTimer !== null) return;
-    const startedAt = Date.now();
-    elapsed = 0;
-    tickTimer = setInterval(() => {
-      elapsed = Math.round((Date.now() - startedAt) / 1000);
-    }, 1000);
+  function stopTicker() {
+    if (tickTimer !== null) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+    }
+  }
+
+  /**
+   * Polls the harness status, fast while a boot is in flight and slowly otherwise.
+   *
+   * THE POLL NEVER STOPS, AND THAT IS THE PHASE 2B FIX. It used to run ONLY while the
+   * status was `starting`, and every other path called `stopTimers()` - so once the
+   * harness was up, nothing read the status again until the user pressed Refresh or
+   * clicked a button. Two things then left this card showing a stale harness:
+   *
+   *   * the VERSION MANAGER switching versions - it calls `versions_switch` and
+   *     tracks the job on its own, so this window was never told;
+   *   * the MENU'S Switch/Stop, which deliberately goes straight to the sidecar (Q74).
+   *
+   * The reported symptom was exactly that: after a switch the card still showed the
+   * old version and an "Open Harness" button pointing at the DEAD URL the previous
+   * harness had served, so clicking it produced a loading error; pressing Refresh
+   * corrected everything at once. A dashboard whose whole job is to report state must
+   * poll for state it did not cause.
+   *
+   * 500 ms while `starting` (so elapsed time and the arrival of a URL are prompt),
+   * 5 s otherwise (a cheap loopback read, and the only way to notice a change made
+   * anywhere else).
+   *
+   * The choice itself is `harnessPollMs` in `src/lib/version-refresh.js`, which is
+   * unit-tested - the bug was in that decision, not in `setInterval`.
+   */
+  function startPolling(statusForCadence: string | null = null) {
+    const interval = harnessPollMs(statusForCadence);
+
+    // Elapsed seconds only matter during a boot.
+    if (interval === HARNESS_ACTIVE_POLL_MS) {
+      if (tickTimer === null) {
+        const startedAt = Date.now();
+        elapsed = 0;
+        tickTimer = setInterval(() => {
+          elapsed = Math.round((Date.now() - startedAt) / 1000);
+        }, 1000);
+      }
+    } else {
+      stopTicker();
+      elapsed = 0;
+    }
+
+    // Already polling at the right cadence? Nothing to change.
+    if (pollTimer !== null && pollIntervalMs === interval) return;
+
+    if (pollTimer !== null) clearInterval(pollTimer);
+    pollIntervalMs = interval;
     pollTimer = setInterval(() => {
       void refresh();
-    }, POLL_MS);
+    }, interval);
   }
 
   async function refresh() {
@@ -138,13 +205,14 @@
       if (next === null) return;
       status = next;
 
-      if (next.status === "starting") {
-        startPolling();
-      } else {
-        stopTimers();
-        // A stop closes the harness window from the shell side, so mirror that.
-        if (next.status !== "running") harnessWindowOpen = false;
-      }
+      // Fast while booting, slow otherwise - but NEVER stopped. See `startPolling`.
+      startPolling(next.status);
+
+      // A stop closes the harness window from the shell side, so mirror that. A
+      // SWITCH also replaces the URL, and the card must follow it: `status` above
+      // already carries the new one, which is what makes "Open Harness" correct again
+      // without the user pressing Refresh.
+      if (next.status !== "running") harnessWindowOpen = false;
 
       // The wizard's hand-off: "Install and Open Harness" is not finished until
       // the harness window is actually showing, and that cannot happen until the
@@ -155,7 +223,9 @@
       }
     } catch (error) {
       shellError = String(error);
-      stopTimers();
+      // Still poll: a transient shell hiccup must not leave the card frozen until a
+      // manual Refresh. `initialRefresh` owns the decision to SHOW an error.
+      startPolling(status?.status);
     }
   }
 
@@ -186,7 +256,9 @@
 
       if (outcome.phase === CONNECT_PHASE.READY && outcome.status) {
         status = outcome.status as HarnessStatus;
-        if (status.status === "starting") startPolling();
+        // A dashboard whose job is to report state must poll for state it did not
+        // cause, so the poll starts here and only changes cadence afterwards.
+        startPolling(status.status);
         return;
       }
 
@@ -209,12 +281,9 @@
     try {
       const response = await invoke<ProxiedResponse>("harness_start");
       const next = readResponse(response);
-      if (next !== null) {
-        status = next;
-        if (next.status === "starting") startPolling();
-      }
-      // Poll regardless: a 202 may arrive before the first status read.
-      startPolling();
+      if (next !== null) status = next;
+      // Poll fast: a start is in flight, so the card should follow it promptly.
+      startPolling("starting");
     } catch (error) {
       shellError = String(error);
     } finally {
@@ -233,7 +302,9 @@
     } catch (error) {
       shellError = String(error);
     } finally {
-      stopTimers();
+      // The ticker stops (no boot is in flight) but the POLL does not - `refresh`
+      // below re-establishes it at the idle cadence.
+      stopTicker();
       busy = false;
       void refresh();
     }
@@ -343,7 +414,7 @@
     // Already booting - most likely adopted from a previous session, or started by
     // the menu. Just wait for it.
     pendingOpen = true;
-    startPolling();
+    startPolling("starting");
   }
 
   onMount(() => {
@@ -376,12 +447,53 @@
       },
     );
 
+    /**
+     * The shell's `panel:open` event: which section to reveal, and why.
+     *
+     * `Show all versions…` (Q78) and the switch outcome both arrive here. The shell
+     * keeps NO notion of a version section - it emits a tab name and this dashboard
+     * decides what that means - which is why Phase 3 can add real tabs without
+     * touching the menu.
+     *
+     * `message` is shown when present. It carries the switch outcome, including the
+     * Q80 error text for a failed switch, so a switch started from the menu reports
+     * back even when this window was closed at the time: the shell opens this window
+     * and delivers the message with it.
+     */
+    const panelOpen = listen<{ tab?: string; message?: string | null }>("panel:open", (event) => {
+      if (event.payload?.tab === "versions") {
+        const target = document.getElementById("versions");
+        if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+      const message = event.payload?.message;
+      if (message) panelMessage = message;
+    });
+
     return () => {
+      // Unmount is the ONE place both timers stop. Every other path keeps the poll
+      // alive, because a stopped poll is a card that shows a stale harness.
       stopTimers();
       void menuActions.then((unlisten) => unlisten());
       void installAndOpenEvent.then((unlisten) => unlisten());
+      void panelOpen.then((unlisten) => unlisten());
     };
   });
+
+  /**
+   * The version manager's report that a switch SUCCEEDED.
+   *
+   * A plain callback prop rather than an event or a store: the child is rendered
+   * directly by this component, there is exactly one listener, and the payload is
+   * nothing. The steady poll below would correct the Harness card within 5 s anyway;
+   * this makes it immediate for a switch the user just clicked and is watching.
+   *
+   * The MENU's switch does not come through here - it goes straight to the sidecar
+   * (Q74) - which is precisely why the steady poll exists as well. Two mechanisms,
+   * because they cover two different origins.
+   */
+  function onSwitchComplete() {
+    void refresh();
+  }
 
   function formatStartedAt(value: string | null): string {
     if (!value) return "—";
@@ -484,6 +596,19 @@
       <button onclick={refresh} disabled={busy}>Refresh</button>
     </div>
   </section>
+
+    <!-- Version manager (Phase 2B). Its own card, with its own fetches: see the
+         import comment for why its polling is not folded into the status loop. -->
+    {#if panelMessage}
+      <!-- The shell's message for a version operation it performed itself - today
+           only a menu switch (Q74). Dismissible, because it is a report and not a
+           state the dashboard can re-derive. -->
+      <p class="note panel-message">
+        {panelMessage}
+        <button class="dismiss" onclick={() => (panelMessage = null)}>Dismiss</button>
+      </p>
+    {/if}
+    <VersionManager onSwitchComplete={onSwitchComplete} />
 
   <footer>
     <span class="dot"></span>
@@ -598,6 +723,24 @@
 
   .progress {
     color: var(--dsh-accent);
+  }
+
+  .panel-message {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    margin-top: 1.5rem;
+    padding: 0.75rem;
+    border: 1px solid rgb(0 180 216 / 0.3);
+    border-radius: 0.5rem;
+    background: rgb(0 180 216 / 0.06);
+    color: var(--dsh-text, #f0f0f0);
+  }
+
+  .dismiss {
+    flex: 0 0 auto;
+    padding: 0.15rem 0.6rem;
+    font-size: 0.75rem;
   }
 
   .error {

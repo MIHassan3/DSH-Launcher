@@ -492,7 +492,10 @@ fn harness_status(
     // plan comparison whenever nothing the menu renders has actually moved.
     if let Some(runtime) = app.try_state::<menu::MenuRuntime>() {
         let snapshot = menu::snapshot_from_response(&response);
-        if runtime.update_harness(&snapshot) {
+        // `update_snapshot`, not `update_harness`: the payload also carries the
+        // installed-version list, and calling only the harness guard would leave a
+        // fresh install or delete invisible to the menu until the next poll.
+        if runtime.update_snapshot(&snapshot) {
             menu::rebuild_menu(&app, menu::RebuildReason::StatusChange);
         }
     }
@@ -534,9 +537,230 @@ fn harness_stop(
     response
 }
 
+/// Calls one control route, resolving the sidecar state from the app handle.
+///
+/// The `#[tauri::command]` proxies take `tauri::State`, which cannot be obtained from
+/// a worker thread. This wrapper exists for callers that hold only an `AppHandle` -
+/// today the menu's switch worker (Q74), which must not run the request on the main
+/// thread. Identical semantics to [`proxy_control`]: it never panics, and a sidecar
+/// that is not up yields a `ProxiedResponse` carrying the shell's startup error.
+pub(crate) fn proxy_control_app<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    method: &str,
+    path: &str,
+) -> ProxiedResponse {
+    match app.try_state::<SidecarState>() {
+        Some(state) => proxy_control(&state, method, path),
+        None => ProxiedResponse::unavailable(
+            "The DSH-Dock core is not wired into this app, so no control route can be called.",
+            None,
+        ),
+    }
+}
+
 /// True when the `harness` window currently exists.
 fn harness_window_open(app: &tauri::AppHandle) -> bool {
     app.get_webview_window(HARNESS_WINDOW_LABEL).is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2B: the version library's five commands
+// ---------------------------------------------------------------------------
+//
+// NARROW AND TYPED, DELIBERATELY. There is one command per user-facing action, each
+// building a FIXED sidecar path. A single parameterized proxy - "call this URL for
+// me" - was considered and rejected: it would let the dashboard reach every route
+// the sidecar ever grows, which is the same reason `proxy_control` is not `pub`.
+//
+// The commands carry no launcher logic. They build a path, call the sidecar, and
+// hand the body back untouched, exactly like the three harness commands. Every
+// decision (does this version need installing, may it be deleted, has it finished)
+// belongs to the sidecar.
+//
+// WHY THE PATHS ARE BUILT HERE AND NOT IN THE FRONTEND. A version is a path segment
+// or a query parameter on the sidecar, so it needs percent-encoding; doing that in
+// TypeScript would put URL construction in two places, and the one that gets it
+// wrong is the one used for the dangerous operations.
+
+/// The exact command names, in one place, for `build.rs` and the capability file.
+///
+/// A test asserts these names match the ones `generate_handler!` registers and the ones
+/// `build.rs` declares, because a command missing from either place compiles and then
+/// fails at runtime with a confusing "not allowed" error.
+pub const VERSION_COMMANDS: [&str; 6] = [
+    "versions_list",
+    "versions_progress",
+    "versions_download",
+    "versions_switch",
+    "versions_delete",
+    // THE SIXTH, ADDED IN STEP 9 AND REPORTED AS A DEVIATION. The phase brief asks the
+    // version section to list AVAILABLE versions, and none of the five 7a commands can
+    // reach the registry listing. Read-only and additive; it builds a fixed path and
+    // takes nothing but a refresh flag.
+    "versions_available",
+];
+
+/// Percent-encodes one query-string value using a conservative whitelist.
+///
+/// WHY NOT A CRATE. `form_urlencoded`/`url` would be a new dependency for one
+/// function, and this shell keeps its dependency tree deliberately small (see the
+/// `ureq` note in Cargo.toml). The encoding that is actually needed is well defined
+/// and fully unit-tested below.
+///
+/// WHY IT MATTERS AT ALL. The sidecar decodes with `URLSearchParams`, which treats
+/// `+` as a SPACE. A version's build metadata may legally contain `+`
+/// (`1.0.0+build.5`), so passing one through raw would deliver `1.0.0 build.5` to the
+/// sidecar - which would then refuse it as an invalid version, and the user would see
+/// "not an exact version" about a version that is exactly right.
+///
+/// Everything outside ASCII alphanumerics and `-._~` is encoded, so a space, `+`,
+/// `&`, `=`, `#`, `%` and any UTF-8 byte are all safe. Over-encoding is harmless:
+/// `%XX` decodes back to the same value.
+pub(crate) fn encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        let safe = matches!(
+            byte,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+        );
+        if safe {
+            out.push(*byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Builds `?version=<encoded>` (plus `&partial=1` when asked) for a route.
+fn version_query(version: &str, partial: bool) -> String {
+    let mut query = format!("?version={}", encode_query_value(version));
+    if partial {
+        query.push_str("&partial=1");
+    }
+    query
+}
+
+/// Every path this shell asks the sidecar for, built in one place.
+///
+/// `#[allow(dead_code)]` because 7a wires the commands without a caller: the menu
+/// work that consumes them is 7b, and a dead-code warning on a deliberately-staged
+/// command would train a reader to ignore the warnings that matter. The paths are
+/// unit-tested now so 7b cannot silently invent a different one.
+#[allow(dead_code)]
+pub(crate) struct VersionRoutes;
+
+#[allow(dead_code)]
+impl VersionRoutes {
+    /// One round trip that draws the version screen: library, progress, running version.
+    pub(crate) const LIST: &'static str = "/versions/status";
+
+    /// The job the UI polls while an install or a switch runs.
+    pub(crate) const PROGRESS: &'static str = "/versions/progress";
+
+    /// The registry listing: which versions exist and which are already installed.
+    ///
+    /// `?refresh=1` bypasses the sidecar's 60s cache. It is OPTIONAL and defaults to
+    /// off, so a UI that fetches on mount cannot hammer the public registry.
+    pub(crate) fn available(refresh: bool) -> String {
+        if refresh {
+            "/registry/versions?refresh=1".to_owned()
+        } else {
+            "/registry/versions".to_owned()
+        }
+    }
+
+    /// `POST` to install one exact version. A PATH SEGMENT, not a query parameter,
+    /// because that is the shape the phase specifies.
+    pub(crate) fn download(version: &str) -> String {
+        format!("/registry/download/{}", encode_query_value(version))
+    }
+
+    /// `POST` to switch the running harness to one exact version.
+    pub(crate) fn switch(version: &str) -> String {
+        format!("/versions/switch{}", version_query(version, false))
+    }
+
+    /// `POST` to delete one version, with the partial flag deciding which intent.
+    pub(crate) fn delete(version: &str, partial: bool) -> String {
+        format!("/library/delete{}", version_query(version, partial))
+    }
+}
+
+/// Proxy for `GET /versions/status`.
+///
+/// The dashboard's page-load call: it returns the installed library, the in-flight
+/// job, the running version and the minimum supported version together, so drawing
+/// the version screen is one round trip rather than two.
+#[tauri::command]
+fn versions_list(state: tauri::State<'_, SidecarState>) -> ProxiedResponse {
+    proxy_control(&state, "GET", VersionRoutes::LIST)
+}
+
+/// Proxy for `GET /versions/progress` - the job the UI polls while work runs.
+///
+/// A poll, not a stream: the sidecar retains the last finished job, so a UI that
+/// reattaches after an install completed still learns the outcome.
+#[tauri::command]
+fn versions_progress(state: tauri::State<'_, SidecarState>) -> ProxiedResponse {
+    proxy_control(&state, "GET", VersionRoutes::PROGRESS)
+}
+
+/// Proxy for `POST /registry/download/<version>`.
+///
+/// Returns as soon as the sidecar accepts (HTTP 202). It NEVER waits for the
+/// install - a cold one takes minutes, and `PROXY_TIMEOUT` would abandon it. The UI
+/// polls `versions_progress` instead. A download installs and stops there: starting a
+/// harness is the switch's job (Q86).
+#[tauri::command]
+fn versions_download(version: String, state: tauri::State<'_, SidecarState>) -> ProxiedResponse {
+    proxy_control(&state, "POST", &VersionRoutes::download(&version))
+}
+
+/// Proxy for `GET /registry/versions` - what COULD be installed.
+///
+/// `refresh` defaults to false on the Rust side too, so a caller that omits it gets the
+/// cached listing rather than a registry round trip. The sidecar answers `503` with a
+/// typed body when the registry is unreachable; that body passes through verbatim,
+/// because it explains that nothing was changed.
+#[tauri::command]
+fn versions_available(refresh: Option<bool>, state: tauri::State<'_, SidecarState>) -> ProxiedResponse {
+    proxy_control(
+        &state,
+        "GET",
+        &VersionRoutes::available(refresh.unwrap_or(false)),
+    )
+}
+
+/// Proxy for `POST /versions/switch?version=<version>`.
+///
+/// Returns 202 when the switch is accepted and 409 when it is refused (another
+/// operation in flight, or the library locked by another process). Both are normal
+/// results carrying a body the UI should render, which is why they are not errors.
+/// The switch can take minutes, so the UI polls `versions_progress` for the outcome
+/// and `harness_status` for the boot.
+#[tauri::command]
+fn versions_switch(version: String, state: tauri::State<'_, SidecarState>) -> ProxiedResponse {
+    proxy_control(&state, "POST", &VersionRoutes::switch(&version))
+}
+
+/// Proxy for `POST /library/delete?version=<version>[&partial=1]`.
+///
+/// `partial` routes to the sidecar's `deletePartialVersion`, which is the explicit
+/// intent for a tree left behind by an interrupted install. The sidecar refuses the
+/// RUNNING version and anything outside the library regardless of what is asked
+/// here, so this flag cannot widen what may be deleted.
+#[tauri::command]
+fn versions_delete(
+    version: String,
+    partial: Option<bool>,
+    state: tauri::State<'_, SidecarState>,
+) -> ProxiedResponse {
+    proxy_control(
+        &state,
+        "POST",
+        &VersionRoutes::delete(&version, partial.unwrap_or(false)),
+    )
 }
 
 /// Closes the `harness` window if it exists. Returns true when one was closed.
@@ -730,7 +954,11 @@ fn spawn_menu_status_watcher(app: tauri::AppHandle) {
         let snapshot = menu::current_harness_snapshot(&app);
 
         let changed = match app.try_state::<menu::MenuRuntime>() {
-            Some(runtime) => runtime.update_harness(&snapshot),
+            // `update_snapshot` applies BOTH guards - the harness facts and the
+            // installed-version list. The list matters here more than anywhere: an
+            // install or a delete changes it while the harness does not, so a
+            // harness-only guard would leave the submenu stale with no log line.
+            Some(runtime) => runtime.update_snapshot(&snapshot),
             None => false,
         };
 
@@ -845,12 +1073,81 @@ fn build_harness_window(
         log_line("webview2: WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS is set for this process");
     }
 
+    // ATTACH THE APP-WIDE MENU EXPLICITLY, AND WHY THAT IS NECESSARY.
+    //
+    // Section 2.8.3 claims `AppHandle::set_menu()` "assigns the menu to every existing
+    // window that has none, and windows created later inherit it at creation". The
+    // SECOND HALF is FALSE, and this was a real, user-visible bug: the harness window
+    // had no menu bar, so a menu-initiated version switch could not be reached unless
+    // the dashboard happened to be open - defeating the whole point of Q74.
+    //
+    // Tauri 2.11.5 (`app.rs`, `set_menu`) iterates `self.manager.windows()` ONCE, at
+    // call time:
+    //
+    //     for window in self.manager.windows().values() {
+    //         let has_app_wide_menu = window.has_app_wide_menu() || window.menu().is_none();
+    //         if has_app_wide_menu { window.set_menu(menu.clone())?; ... }
+    //     }
+    //
+    // A window created afterwards is not in that map.
+    //
+    // BUT THE WINDOW IS NOT MENU-LESS AT CREATION, and this is the part the first fix got
+    // wrong. `prepare_window_menu_creation_handler` (`manager/menu.rs`) attaches the
+    // app-wide menu to the raw window as it is created:
+    //
+    //     let is_app_wide = self.menu.is_none();          // no explicit .menu() call
+    //     self.menu.or_else(|| app_handle().menu())        // -> the app-wide menu
+    //         .map(|menu| WindowMenu { is_app_wide, menu })
+    //     // ... Option<impl Fn(RawWindow)> that calls init_for_hwnd_with_theme
+    //
+    // So `build()` returns a window that ALREADY has the menu, flagged app-wide. Calling
+    // `window.set_menu(menu)` here was not merely redundant: `Window::set_menu` starts
+    // with `remove_menu()` and then only replaces the MENU, never restoring the
+    // `is_app_wide` flag. It therefore CLEARED the app-wide flag on a window that had
+    // legitimately carried it, and `rebuild_menu`'s guard
+    // (`has_app_wide_menu() || menu().is_none()`) subsequently skipped this window - so
+    // the harness window kept the menu it was created with and never received a rebuilt
+    // one. The menu bar vanishing after a switch is that skip, made visible.
+    //
+    // The attach is therefore NOT done here. Creation already does it, and the app-wide
+    // flag is what keeps the window updatable.
     let window = builder
         .build()
         .map_err(|error| {
             log_line(&format!("harness window build FAILED for {shown}: {error}"));
             format!("Could not open the harness window: {error}")
         })?;
+
+    // Diagnostic, and the ONE thing worth checking at run time here: the window must
+    // arrive carrying the app-wide menu, because nothing else in the app will ever give
+    // it one. `has_app_wide_menu` is `pub(crate)` in tauri and cannot be read from this
+    // crate, so the observable proxy is the menu's IDENTITY - compared against the
+    // app-wide menu in `rebuild_menu`'s "menu app-wide attach:" line.
+    {
+        match (window.menu(), app.menu()) {
+            (Some(held), Some(app_wide)) => log_line(&format!(
+                "harness window menu after create: held={} app_wide={} match={}",
+                held.id().as_ref(),
+                app_wide.id().as_ref(),
+                held.id() == app_wide.id()
+            )),
+            (None, _) => log_line(
+                "harness window menu after create: NONE - this window will never be \
+                 updated by a rebuild (expected: creation attaches the app-wide menu)",
+            ),
+            (Some(held), None) => log_line(&format!(
+                "harness window menu after create: held={} but the app has no app-wide menu",
+                held.id().as_ref()
+            )),
+        }
+    }
+
+    // `set_menu` on ONE window does not touch the others (it is window-scoped, unlike
+    // `AppHandle::set_menu`), so in principle the wizard is unaffected. Re-clearing is
+    // one cheap call and keeps the wizard's two-part guard - clear at creation,
+    // re-clear after every rebuild - true for this call site as well, rather than
+    // resting on an assumption about which of the two `set_menu` shapes is in play.
+    crate::menu::clear_welcome_menu(app, "harness window create");
 
     log_line(&format!(
         "harness window build() returned in {}ms",
@@ -1586,7 +1883,17 @@ pub fn run() {
             harness_stop,
             open_harness_window,
             close_harness_window,
-            welcome_submit
+            welcome_submit,
+            // Phase 2B (7a): the version library's five commands. Registered here AND
+            // declared in build.rs's AppManifest - Tauri v2 does not auto-discover,
+            // and a command missing from either place fails at build or at runtime
+            // rather than silently.
+            versions_list,
+            versions_progress,
+            versions_download,
+            versions_switch,
+            versions_delete,
+            versions_available
         ])
         // Every webview page load, named. The harness window logs its own (with
         // navigation diagnostics); this covers the CONFIG window, whose URL says
@@ -2344,5 +2651,411 @@ mod tests {
             main_rs.contains("not(debug_assertions)"),
             "the attribute must apply to release builds only"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2B: the version commands' path construction and registration
+    //
+    // These are pure functions on purpose. The commands themselves only build a
+    // path and hand it to `proxy_control`, so the part that can be WRONG - the
+    // encoding, the segment-vs-query choice, and the three-file registration - is
+    // exactly the part that needs no app, no sidecar and no window to test.
+    // -----------------------------------------------------------------------
+
+    /// Cuts `[start, end)` out of `text`, panicking with a useful message if the
+    /// frame is absent. Used to look INSIDE a structure rather than at a whole file.
+    fn slice_between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+        let from = text
+            .find(start)
+            .unwrap_or_else(|| panic!("could not find {start:?}"));
+        let rest = &text[from + start.len()..];
+        let to = rest
+            .find(end)
+            .unwrap_or_else(|| panic!("could not find {end:?} after {start:?}"));
+        &rest[..to]
+    }
+
+    /// Every Rust string literal in a fragment, in order.
+    fn string_literals(text: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut chars = text.char_indices().peekable();
+        while let Some((_, ch)) = chars.next() {
+            if ch != '"' {
+                continue;
+            }
+            let mut literal = String::new();
+            for (_, inner) in chars.by_ref() {
+                if inner == '"' {
+                    break;
+                }
+                literal.push(inner);
+            }
+            found.push(literal);
+        }
+        found
+    }
+
+    /// The command names declared in `build.rs`'s `AppManifest::commands([...])`.
+    fn declared_in_build_rs() -> Vec<String> {
+        let source = include_str!("../build.rs");
+        string_literals(slice_between(source, ".commands(&[", "])"))
+    }
+
+    /// The `allow-<command>` permission identifiers granted to the main window.
+    fn granted_in_default_capability() -> Vec<String> {
+        let raw = include_str!("../capabilities/default.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw).expect("capabilities/default.json must be valid JSON");
+        parsed["permissions"]
+            .as_array()
+            .expect("permissions must be an array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .filter_map(|value| value.strip_prefix("allow-"))
+            // `allow-open-harness-window` and friends are not version commands.
+            .filter(|value| value.starts_with("versions-"))
+            .map(|value| value.replace('-', "_"))
+            .collect()
+    }
+
+    #[test]
+    fn query_values_encode_everything_that_could_change_meaning() {
+        // `+` is THE case this exists for: the sidecar decodes with
+        // `URLSearchParams`, which reads a raw `+` as a SPACE, so an unencoded
+        // `1.0.0+build.5` would arrive as `1.0.0 build.5` and be refused as an
+        // invalid version - about a version that is exactly right.
+        assert_eq!(encode_query_value("1.0.0+build.5"), "1.0.0%2Bbuild.5");
+
+        // The delimiters that would otherwise split or truncate the query string.
+        assert_eq!(encode_query_value("a&b=c"), "a%26b%3Dc");
+        assert_eq!(encode_query_value("a#b"), "a%23b");
+        assert_eq!(encode_query_value("a?b"), "a%3Fb");
+        assert_eq!(encode_query_value("a b"), "a%20b");
+        // A literal `%` must not be mistaken for the start of an escape.
+        assert_eq!(encode_query_value("100%"), "100%25");
+        // UTF-8 is encoded byte-wise, so no multi-byte character can slip through.
+        assert_eq!(encode_query_value("é"), "%C3%A9");
+
+        // What must survive untouched: real version strings, including build metadata.
+        assert_eq!(encode_query_value("0.2.0-rc.2"), "0.2.0-rc.2");
+        assert_eq!(encode_query_value("1.2.3-alpha.10+build.5"), "1.2.3-alpha.10%2Bbuild.5");
+        assert_eq!(encode_query_value(""), "");
+        assert_eq!(encode_query_value("a-._~Z9"), "a-._~Z9");
+    }
+
+    #[test]
+    fn the_version_routes_are_the_ones_the_sidecar_serves() {
+        // The literal paths, so a change on either side has to be deliberate. They
+        // are the routes `sidecar/lib/version-jobs.js`'s `handle()` matches.
+        assert_eq!(VersionRoutes::LIST, "/versions/status");
+        assert_eq!(VersionRoutes::PROGRESS, "/versions/progress");
+
+        assert_eq!(
+            VersionRoutes::download("0.2.0-rc.2"),
+            "/registry/download/0.2.0-rc.2"
+        );
+        assert_eq!(
+            VersionRoutes::switch("0.2.0-rc.2"),
+            "/versions/switch?version=0.2.0-rc.2"
+        );
+        assert_eq!(
+            VersionRoutes::delete("0.2.0-rc.2", false),
+            "/library/delete?version=0.2.0-rc.2"
+        );
+        assert_eq!(
+            VersionRoutes::delete("0.2.0-rc.2", true),
+            "/library/delete?version=0.2.0-rc.2&partial=1"
+        );
+    }
+
+    #[test]
+    fn a_download_puts_the_version_in_a_path_and_a_switch_in_a_query() {
+        // THE DELIBERATE INCONSISTENCY, pinned. The phase specification names
+        // `/registry/download/<version>` as a path segment while a switch names its
+        // target with `?version=`. Keeping both is a decision, not an oversight, and
+        // this test is what stops a later "tidy-up" from silently changing one of
+        // them into a 404.
+        let download = VersionRoutes::download("1.0.0+build.5");
+        assert!(
+            download.starts_with("/registry/download/"),
+            "a download must address the version as a path segment: {download}"
+        );
+        assert!(!download.contains("?version="), "the download path takes no query: {download}");
+
+        let switching = VersionRoutes::switch("1.0.0+build.5");
+        assert!(
+            switching.starts_with("/versions/switch?"),
+            "a switch must name the version as a query parameter: {switching}"
+        );
+        assert!(
+            !switching.contains("/versions/switch/"),
+            "a switch must not put the version in the path: {switching}"
+        );
+
+        // And an encoded `+` in a path segment is still just a value: the sidecar
+        // decodes the segment with `decodeURIComponent`, which reads `%2B` as `+`.
+        assert_eq!(VersionRoutes::download("1.0.0+build.5"), "/registry/download/1.0.0%2Bbuild.5");
+    }
+
+    #[test]
+    fn a_version_can_never_escape_its_route() {
+        // Defense in depth: the sidecar validates the name and refuses anything that
+        // is not an exact version, so this is not the only guard. But a shell that
+        // would happily build a path containing an UNENCODED separator is one
+        // refactor away from asking the sidecar for something else entirely.
+        //
+        // NOTE ON WHAT IS ASSERTED. `..%2F..%2Fevil` still CONTAINS `..`, and that is
+        // fine and correct: the slashes are percent-encoded, so the sidecar's
+        // `decodeURIComponent` sees one path segment whose value is `../../evil`, and
+        // its version-name gate refuses it. The dangerous thing is an unencoded
+        // separator, which is what would create extra segments - so that is what is
+        // checked.
+        for hostile in ["../../evil", "..\\..\\evil", "a/b", "a?b", "a#b", "a&b"] {
+            let download = VersionRoutes::download(hostile);
+            let switching = VersionRoutes::switch(hostile);
+
+            // Exactly one path segment after the prefix - no unencoded slash can
+            // have created another.
+            assert_eq!(
+                download.matches('/').count(),
+                3,
+                "download gained or lost a path segment: {download}"
+            );
+            assert!(
+                !download[1..].contains('\\') && !switching.contains('\\'),
+                "a backslash survived into the path: {download} / {switching}"
+            );
+            assert!(
+                !download.contains('?') && !switching[1..].contains('#'),
+                "a query or fragment delimiter leaked: {download} / {switching}"
+            );
+            // Exactly one query delimiter, and no second parameter smuggled in.
+            assert_eq!(
+                switching.matches('?').count(),
+                1,
+                "switch gained a query delimiter: {switching}"
+            );
+            assert_eq!(
+                switching.matches('&').count(),
+                0,
+                "switch must not gain a second parameter from a value: {switching}"
+            );
+            // Nothing outside the unreserved set survived raw.
+            assert!(
+                download
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || "-._~/%".contains(ch)),
+                "an unencoded character reached the path: {download}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_version_command_is_declared_granted_and_registered() {
+        // THE THREE-FILE PIN. Tauri v2 does not auto-discover app commands, so the
+        // same name has to appear in three places. A name missing from `build.rs` or
+        // the capability file produces NO permission identifier, and the failure
+        // appears only at runtime as "not allowed" - the least diagnosable shape.
+        // SIX AS OF STEP 9: the five the phase specified, plus the registry listing
+        // that the version section's "Available" table requires and the five cannot
+        // reach. The count is asserted so a seventh command has to be a deliberate
+        // change to this test rather than an accident.
+        assert_eq!(
+            VERSION_COMMANDS.len(),
+            6,
+            "five phase-specified commands plus the registry listing added in Step 9"
+        );
+
+        let declared = declared_in_build_rs();
+        for command in VERSION_COMMANDS {
+            assert!(
+                declared.iter().any(|entry| entry == command),
+                "{command} is not declared in build.rs's AppManifest::commands; declared: {declared:?}"
+            );
+        }
+
+        let granted = granted_in_default_capability();
+        for command in VERSION_COMMANDS {
+            assert!(
+                granted.iter().any(|entry| entry == command),
+                "{command} has no allow-{command} grant in capabilities/default.json; granted: {granted:?}"
+            );
+        }
+
+        // And the reverse direction: this list may not be missing a command the
+        // other two files know about.
+        for command in &declared {
+            if !command.starts_with("versions_") {
+                continue;
+            }
+            assert!(
+                VERSION_COMMANDS.contains(&command.as_str()),
+                "{command} is declared in build.rs but absent from VERSION_COMMANDS - the list has drifted"
+            );
+        }
+        for command in &granted {
+            assert!(
+                VERSION_COMMANDS.contains(&command.as_str()),
+                "{command} is granted in the capability file but absent from VERSION_COMMANDS - the list has drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_version_commands_are_narrow_and_typed() {
+        // A parameterized proxy - one command taking a URL - was rejected because it
+        // would let the dashboard reach every route the sidecar ever grows. The
+        // narrow surface is the point, so it is asserted rather than assumed: each
+        // command builds a FIXED prefix and only a validated version value varies.
+        let prefixes = [
+            VersionRoutes::download("1.2.3"),
+            VersionRoutes::switch("1.2.3"),
+            VersionRoutes::delete("1.2.3", false),
+        ];
+        assert!(prefixes[0].starts_with("/registry/download/"));
+        assert!(prefixes[1].starts_with("/versions/switch?version="));
+        assert!(prefixes[2].starts_with("/library/delete?version="));
+
+        let source = include_str!("lib.rs");
+
+        // The three that act on a version take it as a typed String, and NONE of the
+        // five accepts a caller-supplied path or method - which is precisely what a
+        // parameterized proxy would have needed.
+        for command in ["versions_download", "versions_switch", "versions_delete"] {
+            let signature = slice_between(source, &format!("fn {command}("), ") -> ProxiedResponse");
+            assert!(
+                signature.contains("version: String"),
+                "{command} should take its target as a typed String: {signature}"
+            );
+            assert!(
+                !signature.contains("path:") && !signature.contains("route:") && !signature.contains("url:"),
+                "{command} must not accept a caller-supplied path: {signature}"
+            );
+        }
+
+        // The two that only read take NO arguments beyond the app state. A command
+        // that grew a path parameter would be the parameterized proxy in disguise.
+        for command in ["versions_list", "versions_progress"] {
+            let signature = slice_between(source, &format!("fn {command}("), ") -> ProxiedResponse");
+            assert!(
+                !signature.contains("path:")
+                    && !signature.contains("route:")
+                    && !signature.contains("url:")
+                    && !signature.contains("version:"),
+                "{command} must take nothing but the app state: {signature}"
+            );
+        }
+
+        // And no version command may accept a METHOD, which is how a narrow surface
+        // would start to become a general one.
+        for command in VERSION_COMMANDS {
+            let signature = slice_between(source, &format!("fn {command}("), ") -> ProxiedResponse");
+            assert!(
+                !signature.contains("method:"),
+                "{command} must not accept a caller-supplied method: {signature}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2B: the harness window's menu bar
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_harness_window_attaches_the_app_wide_menu_at_creation() {
+        // THE BUG THIS PINS. Section 2.8.3 claimed `AppHandle::set_menu()` gives the
+        // menu to "windows created later ... at creation". It does not: tauri 2.11.5's
+        // `set_menu` iterates `self.manager.windows()` ONCE, so a window built
+        // afterwards starts with NO menu and nothing attaches one. The harness window
+        // therefore had no menu bar, and a menu-initiated version switch was
+        // unreachable unless the dashboard happened to be open - which defeats the
+        // entire point of Q74 (a switch must not depend on the dashboard).
+        //
+        // This asserts the repair is present, and that it uses the WINDOW-scoped
+        // `set_menu` rather than the app-wide one. Calling `app.set_menu` here would
+        // re-run the app-wide attach on every harness window creation, which is why
+        // `every_rebuild_reason_goes_through_the_one_set_menu_call_site` in menu.rs
+        // counts app-wide call sites and would fail.
+        let source = include_str!("lib.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("lib.rs has a non-test section");
+
+        let body = {
+            let start = production
+                .find("fn build_harness_window")
+                .expect("build_harness_window exists");
+            let rest = &production[start..];
+            let end = rest.find("\n}\n").expect("build_harness_window ends");
+            &rest[..end]
+        };
+
+        assert!(
+            body.contains("app.menu()"),
+            "the harness window must read the current app-wide menu"
+        );
+        assert!(
+            body.contains("window.set_menu(menu)"),
+            "and attach it to the NEW window, which set_menu does not do by itself"
+        );
+        assert!(
+            !body.contains("app.set_menu("),
+            "the app-wide set_menu must not be called per window creation"
+        );
+    }
+
+    #[test]
+    fn the_wizard_menu_is_still_recleared_after_the_harness_window_attaches_one() {
+        // The wizard's two-part guard is "clear at creation, re-clear after every
+        // rebuild". The harness window's new attach is a THIRD place a menu is handed
+        // to a window, so the guard is re-applied right after it rather than resting on
+        // an assumption about which `set_menu` shape is in play.
+        let source = include_str!("lib.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("lib.rs has a non-test section");
+
+        let body = {
+            let start = production
+                .find("fn build_harness_window")
+                .expect("build_harness_window exists");
+            let rest = &production[start..];
+            let end = rest.find("\n}\n").expect("build_harness_window ends");
+            &rest[..end]
+        };
+
+        let attach = body
+            .find("window.set_menu(menu)")
+            .expect("the harness window attaches the menu");
+        let reclear = body
+            .find("clear_welcome_menu")
+            .expect("the wizard's menu is re-cleared after the attach");
+        assert!(
+            reclear > attach,
+            "the re-clear must come AFTER the harness window takes the menu"
+        );
+    }
+
+    #[test]
+    fn the_harness_window_is_granted_nothing_new() {
+        // The harness window renders the official UI at a remote URL and must stay
+        // able to call nothing. Adding a version command to its capability would
+        // hand a remote page the launcher's version library.
+        let harness = include_str!("../capabilities/harness.json");
+        for command in VERSION_COMMANDS {
+            assert!(
+                !harness.contains(command),
+                "the harness window must not be granted {command}"
+            );
+        }
+        let welcome = include_str!("../capabilities/welcome.json");
+        for command in VERSION_COMMANDS {
+            assert!(
+                !welcome.contains(command),
+                "the first-run wizard must not be granted {command}"
+            );
+        }
     }
 }

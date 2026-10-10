@@ -11,6 +11,12 @@
     "allow-harness-start",
     "allow-harness-stop",
     "allow-open-harness-window",
-    "allow-close-harness-window"
+    "allow-close-harness-window",
+    "allow-versions-list",
+    "allow-versions-progress",
+    "allow-versions-download",
+    "allow-versions-switch",
+    "allow-versions-delete",
+    "allow-versions-available"
   ]
 }

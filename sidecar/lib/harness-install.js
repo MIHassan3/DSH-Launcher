@@ -190,13 +190,19 @@ export function validateInstalledVersion(version, options = {}) {
 /**
  * Whether this version's tree passes validation.
  *
- * DELIBERATELY NOT WIRED INTO `isInstalled` YET. `control.js`'s start path calls
- * `installVersion`, which short-circuits on `isInstalled`; widening that check
- * means a version installed by Phase 1 - which section 3.1's validation may well
- * call `partial` - stops being adopted and gets reinstalled instead. That is
- * Phase 2's intended *destination*, but it is a behavior change to a working
- * install, and it belongs in Step 3 next to the staged install and the full
- * fake-npm test tier, not in a step whose contract is "additive only".
+ * WIRED INTO THE START PATH IN PHASE 2B. `ensureVersionInstalled` - the entry
+ * point `control.js`'s start path calls - asks this question, so a version
+ * installed by Phase 1 that section 3.1's validation calls `partial` is repaired
+ * rather than adopted. That is Phase 2's intended destination, and it became safe
+ * to land once the switch flow could test it end-to-end: a switch stops the
+ * harness before installing, so the running-version guard cannot fire on a
+ * repair. See `ensureVersionInstalled` for the full statement of the change and
+ * `PROJECT_DSH-DOCK.md` section 8.1 for the deferral this closes.
+ *
+ * The switch flow itself still decides separately whether a target needs
+ * installing (`library.js`'s three-state read) before it stops anything; this
+ * function is what an ordinary start uses to reach the same verdict for the
+ * version it was told to start.
  */
 export function isInstalledAndValid(version, options = {}) {
   return validateInstalledVersion(version, options).ok;
@@ -509,6 +515,42 @@ export function runningVersionGuard(version, options = {}) {
 }
 
 /**
+ * Installs the four progress phases the launcher reports, so the strings exist in
+ * exactly one place.
+ *
+ * THE FOUR ARE HONEST, NOT DECORATIVE. `resolving` is the registry lookup,
+ * `downloading` is npm actually running (the minutes-long step, and genuinely the
+ * network-and-disk bulk), `linking` is the staged tree being renamed onto its final
+ * path, and `validating` is the tree check that decides whether the version exists
+ * at all. Reporting npm's stderr in real time was considered and rejected: it is
+ * hundreds of lines of package-manager noise, it is not a stable interface, and a
+ * phase that is right is worth more than a percentage that is wrong.
+ */
+export const INSTALL_PHASE = Object.freeze({
+  RESOLVING: "resolving",
+  DOWNLOADING: "downloading",
+  LINKING: "linking",
+  VALIDATING: "validating",
+});
+
+/**
+ * Runs `options.onPhase(phase, detail)` without letting a progress reporter break
+ * an install.
+ *
+ * A progress callback is DIAGNOSTIC. If one throws - a closure over a destroyed
+ * object, a bug in a caller - the install it was merely observing must not fail.
+ * Swallowing is the right call here because the alternative is a reporter that can
+ * abort a multi-minute npm run.
+ */
+function reportPhase(options, phase, detail = {}) {
+  try {
+    options?.onPhase?.(phase, detail);
+  } catch {
+    // A progress reporter never fails an install.
+  }
+}
+
+/**
  * Runs npm with the invocation already built, absorbing its output.
  *
  * Split out so the staged and in-place paths run npm EXACTLY the same way - the
@@ -525,6 +567,12 @@ async function runNpmPhase(version, prefixDir, options) {
       { step: "resolve-npm" },
     );
   }
+
+  // The phase is announced BEFORE npm answers, because npm is the slow part: the
+  // UI must be able to say "downloading" during the minutes the work takes, not
+  // after it finishes. Announced only once the invocation is known good, so a
+  // missing npm reports its own error without a phase that never happened.
+  reportPhase(options, INSTALL_PHASE.DOWNLOADING, { version, prefixDir });
 
   const { code, output } = await runNpm(invocation.command, invocation.args, options);
 
@@ -630,7 +678,11 @@ function removeQuietly(dir, platform = process.platform) {
  * @param {string} version exact version, e.g. "0.1.5-rc.2"
  * @param {{force?: boolean, tag?: string, paths?: object, npmCommand?: string,
  *          timeoutMs?: number, approach?: "auto"|"staged"|"in-place",
- *          record?: boolean, runtimeState?: object}} [options]
+ *          record?: boolean, runtimeState?: object, skipShortCircuit?: boolean}} [options]
+ *   `skipShortCircuit` is for `ensureVersionInstalled` only: it means "the strict
+ *   check has already said this tree is not usable, so do not re-ask the cheap
+ *   question and contradict it". It is NOT a weaker `force` - `force` means
+ *   "reinstall even though it IS installed".
  */
 export async function installVersion(version, options = {}) {
   // --- parameterization guard -----------------------------------------------
@@ -648,7 +700,13 @@ export async function installVersion(version, options = {}) {
   const binPath = harnessBinPath(installDir);
 
   // --- short circuit ---------------------------------------------------------
-  if (!options.force && isInstalled(version, { paths })) {
+  //
+  // `skipShortCircuit` is set by `ensureVersionInstalled`, which has already asked
+  // the STRICT question ("does this tree validate?") and answered no. Without this
+  // flag the cheap check here would contradict it - see the note on
+  // `ensureVersionInstalled`. A direct caller passing neither flag keeps the
+  // historical idempotent behavior.
+  if (!options.force && !options.skipShortCircuit && isInstalled(version, { paths })) {
     return {
       version,
       installDir,
@@ -681,7 +739,14 @@ export async function installVersion(version, options = {}) {
     async () => {
       // Re-check under the lock: another process could have finished this exact
       // install while we waited, and re-installing it would be wasted minutes.
-      if (!options.force && isInstalled(version, { paths })) {
+      //
+      // The re-check uses `isInstalled` (not the strict predicate) even on the
+      // skip path, and that is deliberate: its job is to notice that the work was
+      // DONE while we queued, and "the entry point is now a file" is exactly the
+      // evidence that it was. A stricter re-check here would occasionally decide
+      // the finished install is still incomplete and rebuild it, which is the
+      // wasted-minutes failure this short-circuit exists to prevent.
+      if (!options.force && !options.skipShortCircuit && isInstalled(version, { paths })) {
         return {
           version,
           installDir,
@@ -828,6 +893,7 @@ async function installStaged(version, installDir, options) {
   // megabytes of garbage per failed attempt.
   let validation;
   try {
+    reportPhase(options, INSTALL_PHASE.VALIDATING, { version, stagingDir, installDir });
     validation = validateOrThrow(version, stagingDir, {
       installDir,
       stagingDir,
@@ -840,6 +906,7 @@ async function installStaged(version, installDir, options) {
     throw error;
   }
 
+  reportPhase(options, INSTALL_PHASE.LINKING, { version, stagingDir, installDir });
   const moved = renameOntoTarget(stagingDir, installDir, paths, options);
   if (!moved.ok) {
     removeQuietly(stagingDir);
@@ -964,6 +1031,7 @@ async function installInPlace(version, installDir, options) {
 
   let validation;
   try {
+    reportPhase(options, INSTALL_PHASE.VALIDATING, { version, installDir, approach: INSTALL_APPROACH.IN_PLACE });
     validation = validateOrThrow(version, installDir, {
       installDir,
       checkMarker: false, // this path plants the marker itself, before npm runs
@@ -995,13 +1063,97 @@ async function installInPlace(version, installDir, options) {
     }
   }
 
+  // `linking` last on this path, and that is not an accident of ordering: in-place
+  // has no rename to do, so the step that makes the tree official IS the marker
+  // removal. Announced after the removal succeeds, because a phase that claims the
+  // install is final while the marker is still there would be the one lie this
+  // reporting must never tell.
+  reportPhase(options, INSTALL_PHASE.LINKING, {
+    version,
+    installDir,
+    approach: INSTALL_APPROACH.IN_PLACE,
+    markerRemoved: true,
+  });
+
   return { exitCode: npm.code, validation };
 }
 
 /**
  * Convenience used by the startup path: install if absent, otherwise skip.
  * Returns the same shape as [`installVersion`].
+ *
+ * WIRED TO THE STRICT CHECK IN PHASE 2B (section 8.1's deferred rewire). The two
+ * lines below are the ONE place the launcher's start path decides whether a
+ * version needs installing, and they ask the same question `library.js` asks when
+ * it enumerates: does this tree actually validate? A directory that merely
+ * contains a `bin.js` is not an install - it is the wreckage of one.
+ *
+ * WHY HERE AND NOT IN `installVersion`'s SHORT-CIRCUIT. Two reasons, both
+ * deliberate:
+ *
+ *   1. The Phase 2A note on [`isInstalledAndValid`] names this exact seam, and the
+ *      project document records the contract as "one caller today: `control.js`'s
+ *      start path". This function IS that caller's entry point.
+ *   2. `installVersion`'s own short-circuit stays [`isInstalled`], so a FORCED
+ *      recovery of a marked directory keeps behaving exactly as
+ *      `install-flow.js` pins it.
+ *
+ * THE BEHAVIOR CHANGE, STATED EXACTLY. A version whose tree is incomplete -
+ * missing `bin.js`, missing `@deepseek-ai/dsh-web-app`, or carrying `.incomplete` -
+ * is now "not installed" for the purpose of starting the harness, so it is
+ * REPAIRED rather than adopted. Before this change, such a tree was silently
+ * adopted, the harness was spawned, and it died at boot with an opaque
+ * `ERR_MODULE_NOT_FOUND` - section 3.1's named failure mode.
+ *
+ * THE COST OF THE STRICTER CHECK, accepted knowingly: a tree that BOOTS but fails
+ * validation (the realistic case being a `dsh-web-app` that npm hoisted somewhere
+ * our two candidate paths do not cover) turns a near-instant startup into a
+ * multi-minute reinstall, and into a hard failure if npm is unreachable. That is
+ * why this rewire was held back from Phase 2A and why the value it buys - never
+ * adopting a tree we can prove is incomplete - is worth it.
+ *
+ * ORDERING NOTE FOR CALLERS: this is checked AFTER the short-circuit, so a
+ * `partial` tree that is ALSO recorded as the running version reaches
+ * `installVersion` and hits [`runningVersionGuard`]. The switch flow therefore
+ * stops the harness BEFORE reinstalling a target version; see `control.js`.
  */
 export async function ensureVersionInstalled(version, options = {}) {
-  return installVersion(version, { ...options, force: options.force ?? false });
+  const paths = options.paths ?? resolveStatePaths();
+
+  if (!options.force && isInstalledAndValid(version, { paths })) {
+    const installDir = versionInstallDir(version, { paths });
+    return {
+      version,
+      installDir,
+      binPath: harnessBinPath(installDir),
+      skipped: true,
+      tag: options.tag,
+      exitCode: 0,
+      approach: null,
+      stagingDir: null,
+      fallbackReason: null,
+      validation: null,
+      catalogue: null,
+    };
+  }
+
+  // `skipShortCircuit` CARRIES THE DECISION DOWN, AND IT IS NOT OPTIONAL POLISH.
+  //
+  // This function has just established that the tree does NOT validate. If it then
+  // called `installVersion` plainly, that function's own `isInstalled` check - the
+  // historical "does bin.js exist?" test - would see the stale entry point such a
+  // tree usually still has and return `{ skipped: true }` WITHOUT INSTALLING
+  // ANYTHING. The start path would report success, adopt a tree we just proved is
+  // incomplete, and the harness would die at boot with the very
+  // ERR_MODULE_NOT_FOUND this rewire exists to prevent.
+  //
+  // So the caller's verdict is passed down explicitly. `installVersion` is not
+  // being forced: force means "reinstall even if it IS installed" (it also arms the
+  // running-version guard's strictness), while this means "the decision is already
+  // made; do not ask the cheap question again and contradict it".
+  return installVersion(version, {
+    ...options,
+    skipShortCircuit: true,
+    force: options.force ?? false,
+  });
 }

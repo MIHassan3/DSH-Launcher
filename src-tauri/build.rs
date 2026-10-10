@@ -39,6 +39,24 @@ fn main() {
                 // `allow-welcome-submit` exists for capabilities/welcome.json, which
                 // grants it to the `welcome` window and nothing else.
                 "welcome_submit",
+                // Phase 2B (7a): the version library's five commands. One per
+                // user-facing action, each building a FIXED sidecar path - a narrow,
+                // typed surface rather than a parameterized proxy, which could reach
+                // every route the sidecar grows.
+                //
+                // These names must match `VERSION_COMMANDS` in src/lib.rs, and a test
+                // asserts it. A name that drifts between the two files still COMPILES
+                // and then fails at runtime with "not allowed", which is the least
+                // diagnosable shape this mistake can take.
+                "versions_list",
+                "versions_progress",
+                "versions_download",
+                "versions_switch",
+                "versions_delete",
+                // Step 9 added this one so the version section can list what COULD be
+                // installed. The five above cannot reach the registry listing, and the
+                // phase brief requires that list. Read-only and additive.
+                "versions_available",
             ]),
         ),
     )

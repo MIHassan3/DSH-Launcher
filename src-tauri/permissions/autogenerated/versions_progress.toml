@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-versions-progress"
+description = "Enables the versions_progress command without any pre-configured scope."
+commands.allow = ["versions_progress"]
+
+[[permission]]
+identifier = "deny-versions-progress"
+description = "Denies the versions_progress command without any pre-configured scope."
+commands.deny = ["versions_progress"]

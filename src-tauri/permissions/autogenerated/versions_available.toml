@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-versions-available"
+description = "Enables the versions_available command without any pre-configured scope."
+commands.allow = ["versions_available"]
+
+[[permission]]
+identifier = "deny-versions-available"
+description = "Denies the versions_available command without any pre-configured scope."
+commands.deny = ["versions_available"]

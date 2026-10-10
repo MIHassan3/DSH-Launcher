@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-versions-download"
+description = "Enables the versions_download command without any pre-configured scope."
+commands.allow = ["versions_download"]
+
+[[permission]]
+identifier = "deny-versions-download"
+description = "Denies the versions_download command without any pre-configured scope."
+commands.deny = ["versions_download"]

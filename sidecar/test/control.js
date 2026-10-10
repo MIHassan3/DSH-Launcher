@@ -43,6 +43,8 @@ const platform = await import("../lib/platform.js");
 const harness = await import("../lib/harness.js");
 const control = await import("../lib/control.js");
 const service = await import("../lib/service.js");
+const library = await import("../lib/library.js");
+const catalogue = await import("../lib/catalogue.js");
 
 const PATHS = state.resolveStatePaths();
 state.ensureDataDirs(PATHS);
@@ -189,6 +191,48 @@ function fakeInstallFn(fake) {
   });
 }
 
+/**
+ * Builds a COMPLETE install tree, or a deliberately broken one.
+ *
+ * `makeFakeHarness` above writes only a `bin.js`, which the Phase 2B validation
+ * calls `partial` - correct for the lifecycle tests, but useless for testing what
+ * the status payload reports about version STATE. This builder is the library
+ * suite's `makeTree` in miniature, so a fixture can be either kind on purpose.
+ */
+function makeCompleteTree(version, spec = {}) {
+  const installDir = path.join(PATHS.versions, version);
+  const scope = path.join(installDir, "node_modules", "@deepseek-ai");
+  fs.mkdirSync(scope, { recursive: true });
+
+  if (spec.withDsh !== false) {
+    const dshDir = path.join(scope, "dsh");
+    fs.mkdirSync(path.join(dshDir, "lib"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dshDir, "package.json"),
+      JSON.stringify({ name: "@deepseek-ai/dsh", version }, null, 2),
+    );
+    if (spec.withBin !== false) {
+      fs.writeFileSync(path.join(dshDir, "lib", "bin.js"), "// fixture entry point\n");
+    }
+  }
+
+  if (spec.withWebApp !== false) {
+    const webAppDir = path.join(scope, "dsh-web-app");
+    fs.mkdirSync(webAppDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(webAppDir, "package.json"),
+      JSON.stringify({ name: "@deepseek-ai/dsh-web-app" }, null, 2),
+    );
+  }
+
+  return installDir;
+}
+
+/** A tree builder's counterpart: remove a fixture version and its leftovers. */
+function removeTree(version) {
+  fs.rmSync(path.join(PATHS.versions, version), { recursive: true, force: true });
+}
+
 const cleanups = [];
 /** Every fixture child process started by this test, for the final sweep. */
 const spawnedPids = [];
@@ -253,6 +297,11 @@ await report.section("2. start -> status -> stop -> status", async () => {
     "status during the boot carries a progress message",
     typeof during.json.message === "string" && during.json.message.length > 0,
     during.json.message,
+  );
+  report.check(
+    "a REGISTRY start does not name a version before one is resolved",
+    during.json.version === null,
+    String(during.json.version),
   );
 
   await sidecar.control.settled();
@@ -497,6 +546,150 @@ await report.section("error diagnostics carry a log tail", async () => {
     /harness said something bad|no URL line/.test(status.json.lastError ?? ""),
     (status.json.lastError ?? "").slice(0, 300),
   );
+
+  await sidecar.dispose();
+});
+
+await report.section("phase 2B: recentVersions in the status payload", async () => {
+  state.clearRuntimeState(PATHS.runtimeState);
+
+  // A library spanning all three states, with NO catalogue, so this section also
+  // pins section 8.1's cold-start ordering decision: with no dates at all, the
+  // order is the one `listInstalledVersions` already produces (version string
+  // descending) and never a fabricated mtime.
+  const COMPLETE = "5.5.5-complete";
+  const ALSO_COMPLETE = "4.4.4-complete";
+  const BROKEN = "3.3.3-nobin";
+  makeCompleteTree(COMPLETE);
+  makeCompleteTree(ALSO_COMPLETE);
+  // Two independent ways to be unusable, so the `partial` verdict is not pinned
+  // to a single validation code: a missing entry point, and a marker from an
+  // interrupted install. The cheap probe reads BOTH the same way, because both
+  // mean "this directory is not a version you can run".
+  makeCompleteTree(BROKEN, { withBin: false });
+  makeCompleteTree("2.2.2-marked");
+  fs.writeFileSync(path.join(PATHS.versions, "2.2.2-marked", ".incomplete"), "{}\n");
+
+  const sidecar = await startSidecar();
+  cleanups.push(sidecar);
+
+  const res = await request(sidecar.port, "GET", "/harness/status");
+  report.check("the status payload carries recentVersions", Array.isArray(res.json.recentVersions), typeof res.json.recentVersions);
+
+  const byVersion = Object.fromEntries((res.json.recentVersions ?? []).map((e) => [e.version, e]));
+  report.check("a complete tree is reported `installed`", byVersion[COMPLETE]?.state === "installed", JSON.stringify(byVersion[COMPLETE]));
+  report.check("a tree with no bin.js is reported `partial`", byVersion[BROKEN]?.state === "partial", JSON.stringify(byVersion[BROKEN]));
+  report.check(
+    "a tree carrying .incomplete is reported `partial`",
+    byVersion["2.2.2-marked"]?.state === "partial",
+    JSON.stringify(byVersion["2.2.2-marked"]),
+  );
+  report.check("an entry carries installedAt (null with no catalogue)", byVersion[COMPLETE]?.installedAt === null, String(byVersion[COMPLETE]?.installedAt));
+
+  const order = (res.json.recentVersions ?? []).map((e) => e.version);
+  const expected = library
+    .listInstalledVersions({ paths: PATHS, installedAt: catalogue.readInstalledAt({ paths: PATHS }) })
+    .map((e) => e.version);
+  report.check(
+    "the order is exactly the library's own cold-start order",
+    order.join(",") === expected.join(","),
+    `${order.join(",")} vs ${expected.join(",")}`,
+  );
+  report.check("the two 4.x/5.x fixtures sort newest first", order.indexOf(COMPLETE) < order.indexOf(ALSO_COMPLETE), order.join(","));
+
+  // The payload must never hand a consumer the memo's own array.
+  const fresh = await request(sidecar.port, "GET", "/harness/status");
+  report.check(
+    "a second poll reports the same list",
+    (fresh.json.recentVersions ?? []).map((e) => e.version).join(",") === order.join(","),
+  );
+
+  // A version that appears mid-flight must show up once the memo expires. The
+  // libraryTtlMs override exists for exactly this: a caller that cannot wait a
+  // second must not be forced to.
+  const LATE = "6.6.6-late";
+  makeCompleteTree(LATE);
+  const cached = await request(sidecar.port, "GET", "/harness/status");
+  const afterTtl = await sidecar.control.status({ libraryTtlMs: 0 });
+  report.check(
+    "the memo can be bypassed for a caller that needs the truth now",
+    afterTtl.recentVersions.some((e) => e.version === LATE),
+    `cached saw ${(cached.json.recentVersions ?? []).length}, fresh saw ${afterTtl.recentVersions.length}`,
+  );
+
+  await sidecar.dispose();
+  for (const version of [COMPLETE, ALSO_COMPLETE, BROKEN, "2.2.2-marked", LATE]) removeTree(version);
+});
+
+await report.section("phase 2B: startSpecificVersion targets the version it is given", async () => {
+  state.clearRuntimeState(PATHS.runtimeState);
+  const VERSION = "7.7.7-switchtarget";
+  const fake = await makeFakeHarness(VERSION);
+  cleanups.push({ dispose: fake.close });
+
+  const installCalls = [];
+  let registryCalls = 0;
+  const controlOptions = {
+    startFn: fakeStartFn(fake, VERSION),
+    installFn: async (version, options) => {
+      installCalls.push({ version, options });
+      return fakeInstallFn(fake)(version);
+    },
+    // If this is ever called, the switch resolved a version from the registry
+    // instead of starting the one it was told to start. That is the bug this
+    // section exists to catch, so it throws rather than returning something.
+    registryFn: async () => {
+      registryCalls += 1;
+      throw new Error("the registry must not be consulted for an explicit version");
+    },
+    adoptFn: async () => ({ decision: "fresh", stateStatus: "absent", reasons: ["none"], startFresh: true }),
+  };
+
+  const sidecar = await startSidecar(controlOptions);
+  cleanups.push(sidecar);
+
+  const res = await sidecar.control.startSpecificVersion(VERSION);
+  report.check("an explicit start is accepted immediately", res.code === 202, String(res.code));
+  report.check("the accepted payload reports `starting`", res.payload.status === "starting", res.payload.status);
+  report.check(
+    "the accepted payload names the version it was given",
+    res.payload.version === VERSION && res.payload.message.includes(VERSION),
+    `version=${res.payload.version} message=${res.payload.message}`,
+  );
+
+  await sidecar.control.settled();
+
+  report.check("the registry was never consulted", registryCalls === 0, `calls=${registryCalls}`);
+  report.check("the install was asked for exactly the given version", installCalls[0]?.version === VERSION, String(installCalls[0]?.version));
+  report.check(
+    "the install was given the paths it needs",
+    installCalls[0]?.options?.paths?.versions === PATHS.versions,
+    JSON.stringify(installCalls[0]?.options?.paths ?? null),
+  );
+
+  const recorded = state.readRuntimeState(PATHS.runtimeState);
+  report.check("the harness is recorded as running", recorded.status === "ok", recorded.status);
+  report.check(
+    "the recorded version is the one that was requested",
+    recorded.state?.harnessVersion === VERSION,
+    String(recorded.state?.harnessVersion),
+  );
+  report.check(
+    "the recorded install directory agrees with the version",
+    recorded.state?.installDir === fake.installDir,
+    String(recorded.state?.installDir),
+  );
+
+  const status = await request(sidecar.port, "GET", "/harness/status");
+  report.check("status reports running", status.json.status === "running", status.json.status);
+  report.check("status reports the requested version", status.json.version === VERSION, String(status.json.version));
+
+  // THE FAST PATH, for the explicit entry point: starting the version that is
+  // already running must adopt (200) rather than spawn a second harness.
+  const again = await sidecar.control.startSpecificVersion(VERSION);
+  report.check("starting the running version again returns 200", again.code === 200, String(again.code));
+  report.check("and it reports the running harness", again.payload.status === "running", again.payload.status);
+  report.check("no second install happened", installCalls.length === 1, `installCalls=${installCalls.length}`);
 
   await sidecar.dispose();
 });

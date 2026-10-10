@@ -685,20 +685,82 @@ await report.section("a marked directory becomes installed once a good install c
     "and validation rejects it",
     install.isInstalledAndValid(version, { paths: PATHS }) === false,
   );
+  // PHASE 2B PUTS THE REWIRE IN `ensureVersionInstalled`, NOT HERE.
+  //
+  // `installVersion` keeps its historical short-circuit on `isInstalled` (bin.js
+  // exists), and this assertion is the reason: it is what makes a plain
+  // `installVersion` call idempotent for ANY existing directory. The strict
+  // "does this tree actually validate?" question is asked one level up, by
+  // `ensureVersionInstalled` - the entry point `control.js`'s start path calls -
+  // so that the fast path repairs a broken tree while every direct installer call
+  // keeps the behavior the rest of this suite pins.
   report.check(
-    "and a NON-forced install short-circuits on the stale bin.js",
+    "a NON-forced installVersion short-circuits on the stale bin.js",
     (await withEnv(COMPLETE, () =>
       install.installVersion(version, { paths: PATHS, ...stub(), approach: "in-place" }),
     )).skipped === true,
-    "this is exactly why the isInstalled rewire is deferred to its own step: the sticky " +
-      "Phase 1 check makes a marked directory look installable, so a recovery must force",
+    "this is the historical isInstalled check, deliberately unchanged: installVersion is " +
+      "idempotent for any existing directory",
+  );
+
+  // THE REWIRE, asserted on the seam that actually carries it. The start path asks
+  // the STRICT question first, so a marked tree is rebuilt rather than adopted.
+  //
+  // `approach: "in-place"` is requested deliberately: the in-place path writes the
+  // marker ITSELF before npm runs and removes it only after validation passes, so a
+  // successful repair here proves the marker was cleared by the install rather than
+  // merely absent. Staging would land a fresh tree and prove less.
+  const viaStartPath = await withEnv(COMPLETE, () =>
+    install.ensureVersionInstalled(version, { paths: PATHS, ...stub(), approach: "in-place" }),
+  );
+  report.check(
+    "the START PATH no longer short-circuits on the stale bin.js",
+    viaStartPath.skipped === false,
+    `skipped=${viaStartPath.skipped} approach=${viaStartPath.approach}`,
+  );
+  report.check(
+    "the marked tree was rebuilt in place from the start path",
+    viaStartPath.approach === install.INSTALL_APPROACH.IN_PLACE,
+    String(viaStartPath.approach),
+  );
+  report.check(
+    "and the marker is already gone after that rebuild",
+    fs.existsSync(path.join(installDir, validation.INCOMPLETE_MARKER)) === false,
+  );
+  report.check(
+    "and the repaired tree validates, which is what the start path will check next time",
+    install.isInstalledAndValid(version, { paths: PATHS }) === true,
+  );
+
+  // THE SHORT-CIRCUIT IS STILL THERE FOR DIRECT CALLERS. This is the assertion that
+  // keeps the two seams from drifting: `installVersion` stays idempotent for any
+  // existing directory, while the start path repairs. If a future change collapses
+  // the two, exactly one of these two checks fails.
+  const stillSticky = await withEnv(COMPLETE, () =>
+    install.installVersion(version, { paths: PATHS, ...stub(), approach: "in-place" }),
+  );
+  report.check(
+    "a direct installVersion call is still idempotent over the repaired tree",
+    stillSticky.skipped === true,
+    `skipped=${stillSticky.skipped}`,
+  );
+
+  // The FORCED path is re-established on its own marked tree, because the
+  // start-path rebuild above already cleared this one. The two cases must be
+  // observed on separate trees: one asserts "the start path does not
+  // short-circuit", the other asserts "force always reinstalls", and a shared tree
+  // would let the first silently satisfy the second.
+  fs.writeFileSync(path.join(installDir, validation.INCOMPLETE_MARKER), "{}\n");
+  report.check(
+    "the tree is marked again, and reads as partial",
+    library.readLibraryEntry(version, { paths: PATHS }).state === library.LIBRARY_STATE.PARTIAL,
   );
 
   const result = await withEnv(COMPLETE, () =>
     install.installVersion(version, { paths: PATHS, ...stub(), approach: "in-place", force: true }),
   );
 
-  report.check("the recovery install succeeded", result.approach === install.INSTALL_APPROACH.IN_PLACE, String(result.approach));
+  report.check("the forced recovery install succeeded", result.approach === install.INSTALL_APPROACH.IN_PLACE, String(result.approach));
   report.check(
     "the marker is gone",
     fs.existsSync(path.join(installDir, validation.INCOMPLETE_MARKER)) === false,

@@ -43,6 +43,7 @@ import {
   INCOMPLETE_MARKER,
   describeProblems,
   harnessBinPath,
+  hasRequiredEntries,
   isFile,
   validateInstallTree,
 } from "./validation.js";
@@ -258,9 +259,13 @@ export function checksumFor(installDir) {
  *
  * @param {string} version
  * @param {{paths?: object, checksums?: boolean, validate?: boolean}} [options]
- *   `validate: false` skips tree validation and reports a directory that
- *   contains `bin.js` as installed. Used only where a caller has already
- *   validated (the install path) or wants a cheap existence probe.
+ *   `validate: false` uses the SHARED cheap completeness predicate
+ *   (`validation.js`'s `hasRequiredEntries`) instead of the full walk: entries are
+ *   `stat`ed, no manifest is opened or parsed. It is a cheaper route to the same
+ *   verdict for every case except an unreadable or unparseable manifest, which it
+ *   cannot see - see the note in the body for why that direction is the safe one.
+ *   Used where a caller wants a cheap probe (the status payload's version list) or
+ *   has already validated (the install path).
  * @returns {{version: string, state: string, installDir: string, binPath: string,
  *            hasBin: boolean, hasIncompleteMarker: boolean, checksum: string|null,
  *            problems: Array}}
@@ -294,11 +299,24 @@ export function readLibraryEntry(version, options = {}) {
   const hasBin = isFile(binPath);
 
   // The cheap probe: `catalogue.js` uses this shape when it only needs to know
-  // whether the directory a catalogue entry names still exists.
+  // whether the directory a catalogue entry names still exists, and `control.js`'s
+  // status payload uses it for the version list.
+  //
+  // IT ASKS THE SHARED COMPLETENESS PREDICATE, NOT A LOCAL GUESS. An earlier
+  // version decided from `hasBin` plus the marker alone, which reported a tree
+  // missing `@deepseek-ai/dsh-web-app` as `installed` - so the UI offered a
+  // version the start path then refused and silently reinstalled. `validate: false`
+  // means "do not read and parse a manifest per version", NOT "answer a different
+  // question": the required entries are `stat`ed and nothing more, which keeps this
+  // a cheaper route to the same verdict rather than a second opinion.
+  //
+  // What it still cannot see, deliberately: an unreadable or unparseable
+  // `package.json`. Those need the read this path exists to avoid, and the start
+  // path's strict check is what catches them.
   if (options.validate === false) {
     return {
       version,
-      state: hasBin ? LIBRARY_STATE.INSTALLED : LIBRARY_STATE.PARTIAL,
+      state: hasRequiredEntries(installDir) ? LIBRARY_STATE.INSTALLED : LIBRARY_STATE.PARTIAL,
       installDir,
       binPath,
       hasBin,
@@ -383,6 +401,12 @@ export function scanLibraryRoot(options = {}) {
  *
  * @param {{paths?: object, validate?: boolean, checksums?: boolean,
  *          installedAt?: Record<string, string>}} [options]
+ *   `validate: false` is a cheap existence probe asked of every version on a hot
+ *   path - `control.js`'s status payload, on a cache miss. It reports a directory
+ *   containing `bin.js` as `installed`, so it is the wrong question anywhere a
+ *   decision depends on the tree being complete (the start path asks
+ *   `isInstalledAndValid` instead). It deliberately does NOT report the validation
+ *   problems either, because it never collected them.
  * @returns {Array<object>} entries, installed and partial together
  */
 export function listInstalledVersions(options = {}) {

@@ -117,18 +117,21 @@ const LABEL_SHOW_ALL: &str = "Show All";
 const LABEL_QUIT: &str = "Quit DSH-Dock";
 const LABEL_CURRENT_VERSION_PREFIX: &str = "Current version: ";
 
-/// Label of the version-manager entry while the version library does not exist.
+/// Label of the version-manager entry.
 ///
-/// A disabled menu item cannot carry a tooltip, so the reason has to be in the
-/// label itself - the alternative is a clickable item that does nothing, which
-/// is worse than a disabled one that explains why.
-const LABEL_SHOW_ALL_VERSIONS: &str = "Show all versions… (Phase 2)";
+/// The `(Phase 2)` suffix is gone in 2B, because the entry now opens a manager. A
+/// disabled menu item cannot carry a tooltip, so the label has to say what it is;
+/// the reason for a DISABLED state has to live in the label too, which is why the
+/// older wording spelled the phase out.
+const LABEL_SHOW_ALL_VERSIONS: &str = "Show all versions…";
 
 /// Whether the version-manager entry is clickable.
 ///
-/// PHASE 2 OWNER: flips to `true` when the version manager exists. Kept as a
-/// named constant so the flip is one line and shows up in a diff.
-const SHOW_ALL_VERSIONS_ENABLED: bool = false;
+/// PHASE 2B: flipped to `true`. The version manager exists (the dashboard's version
+/// section and `/versions/status` behind it), so this entry now opens something. It
+/// is still a menu-to-dashboard intent - the shell has no notion of a version
+/// section, so when Phase 3 adds real tabs only the dashboard's routing changes.
+const SHOW_ALL_VERSIONS_ENABLED: bool = true;
 
 /// How many recent versions the submenu shows (section 3.8, Q49).
 const RECENT_VERSIONS_LIMIT: usize = 5;
@@ -231,10 +234,13 @@ pub struct MenuState {
     pub auto_update_channel: String,
     /// Which registry channels currently have a release.
     pub available_channels: Vec<String>,
-    /// Known harness versions, newest first, for the `Recent Versions` submenu.
+    /// Known harness versions, newest-first, for the `Recent Versions` submenu.
     ///
-    /// EMPTY until Phase 2 populates the library. The plan caps what it shows.
-    pub recent_versions: Vec<String>,
+    /// EMPTY until the sidecar reports a library (Phase 2B). The plan caps what it
+    /// SHOWS at [`RECENT_VERSIONS_LIMIT`]; the list itself is the whole library,
+    /// because "Show all versions…" must open a manager that holds every version
+    /// rather than only the ones the submenu happened to display.
+    pub recent_versions: Vec<RecentVersion>,
     /// The version currently installed/active, marked `(installed)` when it
     /// appears in `recent_versions`.
     pub installed_version: Option<String>,
@@ -278,6 +284,34 @@ impl MenuState {
     }
 }
 
+/// One installed version, as the menu shows it (section 3.8, Q49).
+///
+/// The submenu renders the version string; `installed_at` is carried because the
+/// catalogue knows it and the Phase 3 version table will want it, but it is
+/// deliberately NOT part of the change comparison below - see [`update_library`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentVersion {
+    /// The exact version, e.g. `0.2.0-rc.2`.
+    pub version: String,
+    /// When it was installed, from the advisory catalogue. `None` for a version
+    /// the catalogue does not know about.
+    pub installed_at: Option<String>,
+}
+
+impl RecentVersion {
+    /// A version with no recorded install date.
+    ///
+    /// Exists so the scenario fixtures and tests read as `RecentVersion::bare("1.2.3")`
+    /// rather than a struct literal repeated twenty times.
+    pub fn bare(version: &str) -> Self {
+        Self {
+            version: version.to_owned(),
+            installed_at: None,
+        }
+    }
+}
+
 /// The harness facts the menu renders, read from the control surface.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HarnessSnapshot {
@@ -289,6 +323,13 @@ pub struct HarnessSnapshot {
     pub pid: Option<u32>,
     /// The sidecar's last error, when it reported one.
     pub last_error: Option<String>,
+    /// Every installed version, newest-first, from the status payload.
+    ///
+    /// CARRIED ON THE SNAPSHOT rather than fetched separately, because the payload
+    /// the 5s watcher already reads is where the sidecar puts it: one HTTP call
+    /// serves both the status label and the version list, so the two can never
+    /// describe different points in time.
+    pub recent_versions: Vec<RecentVersion>,
 }
 
 /// A snapshot for "the sidecar could not be asked".
@@ -303,12 +344,14 @@ pub fn snapshot_unavailable(shell_error: Option<&str>) -> HarnessSnapshot {
             version: None,
             pid: None,
             last_error: Some(error.to_owned()),
+            recent_versions: Vec::new(),
         },
         _ => HarnessSnapshot {
             status: HarnessStatus::Unavailable,
             version: None,
             pid: None,
             last_error: None,
+            recent_versions: Vec::new(),
         },
     }
 }
@@ -360,11 +403,46 @@ pub fn snapshot_from_status_payload(payload: &serde_json::Value) -> HarnessSnaps
                 .map(str::to_owned)
         });
 
+    // Every installed version, newest-first. Tolerant on purpose: a missing,
+    // non-array, or malformed `recentVersions` yields an EMPTY list rather than
+    // discarding the snapshot, because the status label is the menu's primary
+    // information and a bad version list must not cost the user that as well.
+    //
+    // An entry with no usable `version` string is dropped: a menu item built from a
+    // missing version would read `v` and, worse, would carry an id the click handler
+    // could not match back to anything.
+    let recent_versions = payload
+        .get("recentVersions")
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let version = entry
+                        .get("version")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?;
+                    Some(RecentVersion {
+                        version: version.to_owned(),
+                        installed_at: entry
+                            .get("installedAt")
+                            .and_then(|value| value.as_str())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     HarnessSnapshot {
         status,
         version,
         pid,
         last_error,
+        recent_versions,
     }
 }
 
@@ -409,7 +487,12 @@ pub enum MenuAction {
     OpenLogsFolder,
     /// Persist a new `auto_update_channel`.
     SetAutoUpdateChannel(String),
-    /// Switch the active harness version (Phase 2).
+    /// Switch the active harness version.
+    ///
+    /// THE ONE ACTION THAT DOES NOT ROUTE THROUGH THE DASHBOARD (Q74). It is
+    /// dispatched straight to the sidecar on a worker thread, because a switch is a
+    /// stop and a boot - seconds to minutes - and must not depend on the dashboard
+    /// window being open. See `switch_version` for the thread boundary.
     SwitchVersion(String),
     /// Focus the control panel, revealing `tab`.
     OpenControlPanel {
@@ -460,25 +543,25 @@ impl MenuAction {
     /// thread, which is also the thread that pumps both webviews, so an action
     /// that writes a file or spawns a process MUST run on a worker thread.
     ///
-    /// Since the dashboard took ownership of the harness actions, only two
-    /// actions touch anything outside this process: opening the logs folder (a
-    /// process spawn) and writing `settings.json`. Everything else is an event
-    /// emission or window management, which are main-thread safe by construction.
+    /// Since Phase 2B (Q99) every harness action dispatches sidecar-side, so FIVE
+    /// actions now reach outside this process: the three harness actions (each an HTTP
+    /// call to the sidecar), opening the logs folder (a process spawn), and writing
+    /// `settings.json`. Only `OpenControlPanel` and the two notice-only placeholders are
+    /// main-thread work by construction.
     ///
     /// This is documentation and a test seam; the dispatcher's safety comes from
     /// its match arms, not from this method being consulted at runtime.
     pub fn needs_worker(&self) -> bool {
         match self {
-            // Process spawn / disk write.
-            Self::OpenLogsFolder | Self::SetAutoUpdateChannel(_) => true,
+            // Process spawn / disk write / HTTP to the sidecar.
+            Self::OpenLogsFolder
+            | Self::SetAutoUpdateChannel(_)
+            | Self::RestartHarness
+            | Self::StopHarness
+            | Self::SwitchVersion(_) => true,
 
             // Event emission and window management only.
-            Self::RestartHarness
-            | Self::StopHarness
-            | Self::SwitchVersion(_)
-            | Self::HarnessUpdate
-            | Self::DockUpdate
-            | Self::OpenControlPanel { .. } => false,
+            Self::HarnessUpdate | Self::DockUpdate | Self::OpenControlPanel { .. } => false,
         }
     }
 
@@ -506,7 +589,17 @@ impl MenuAction {
                 }
 
                 let version = other.strip_prefix(ID_HARNESS_RECENT_PREFIX)?;
-                if version.is_empty() {
+                // VALIDATED, NOT JUST NON-EMPTY. `../../evil` is a non-empty suffix of
+                // our prefix, so the empty check alone accepted it as a version - and
+                // `switch_version` would then have had to refuse it (it does, through
+                // the same predicate below). Refusing here as well means the parser and
+                // the dispatcher cannot disagree about what a version is, and a stray
+                // id becomes "not ours" rather than "ours but nonsense".
+                //
+                // The build metadata case (`1.2.3-rc.1+build.5`) is why this cannot be
+                // a simple character check: the grammar has two optional suffixes, and
+                // `is_switchable_version` implements it in one place.
+                if !is_switchable_version(version) {
                     return None;
                 }
                 Some(Self::SwitchVersion(version.to_owned()))
@@ -677,24 +770,46 @@ fn auto_update_label(channel: &str) -> &'static str {
 
 /// The `Recent Versions` submenu (section 3.8, Q49).
 ///
-/// Empty today: the version library is Phase 2's work. `state.recent_versions`
-/// may be longer than the menu shows; the cap lives here so no caller has to
-/// know it.
+/// `state.recent_versions` is the WHOLE library, newest-first; the cap lives here so
+/// no caller has to know it. The list is deliberately longer than what is shown:
+/// "Show all versions…" below must open a manager holding every version.
 fn recent_versions_submenu(state: &MenuState) -> PlanNode {
     let mut items: Vec<PlanNode> = Vec::new();
 
-    for version in state.recent_versions.iter().take(RECENT_VERSIONS_LIMIT) {
-        if Some(version) == state.installed_version.as_ref() {
-            // The active version is information, not an action: switching to the
-            // version already running would do nothing.
-            items.push(PlanNode::Label {
-                label: format!("v{version} (installed)"),
+    for entry in state.recent_versions.iter().take(RECENT_VERSIONS_LIMIT) {
+        if Some(&entry.version) == state.installed_version.as_ref() {
+            // THE RUNNING VERSION IS MARKED, AND NOT CLICKABLE (Q100).
+            //
+            // A native CHECK MARK rather than a bullet prefix, so the mark looks like a
+            // mark on every platform instead of like part of the version string - and so
+            // it cannot be confused with the `●` in the status label, which means "what
+            // state is the harness in" rather than "which version is this".
+            //
+            // DISABLED, because switching to the version that is already running is not a
+            // no-op: the sidecar stops the harness and starts it again, which would
+            // restart a working harness for nothing. A checked item IS the natural
+            // platform idiom for "this is the current one" in a radio-style list, and
+            // `PlanNode::Check` already exists for the auto-update options.
+            //
+            // The `(installed)` suffix is gone: the tick says which one is RUNNING, and
+            // every entry here is installed by definition (the list is enumerated from
+            // the library), so the suffix was noise. It survives in the `Label` fallback
+            // below only for the case where the running version is not in the list at
+            // all - then there is nothing to tick, and saying so is the only information
+            // available.
+            items.push(PlanNode::Check {
+                id: format!("{ID_HARNESS_RECENT_PREFIX}{}", entry.version),
+                label: format!("v{}", entry.version),
+                action: MenuAction::SwitchVersion(entry.version.clone()),
+                checked: true,
+                // Not clickable: see above. The tick is information, not an action.
+                enabled: false,
             });
         } else {
             items.push(PlanNode::Action {
-                id: format!("{ID_HARNESS_RECENT_PREFIX}{version}"),
-                label: format!("v{version}"),
-                action: MenuAction::SwitchVersion(version.clone()),
+                id: format!("{ID_HARNESS_RECENT_PREFIX}{}", entry.version),
+                label: format!("v{}", entry.version),
+                action: MenuAction::SwitchVersion(entry.version.clone()),
                 enabled: true,
             });
         }
@@ -969,13 +1084,23 @@ pub fn dump_scenarios() -> Vec<(&'static str, MenuState)> {
         (
             "recent-versions",
             MenuState {
+                // Newest-first, with dates, exactly as the sidecar's payload orders
+                // them. The sixth entry exists so the fixture proves the submenu CAPS
+                // what it shows at RECENT_VERSIONS_LIMIT while the state keeps all of
+                // it - which is what "Show all versions…" depends on.
                 recent_versions: vec![
-                    "0.1.5-rc.2".to_owned(),
-                    "0.1.5-rc.1".to_owned(),
-                    "0.1.5-alpha.2".to_owned(),
-                    "0.1.4-rc.3".to_owned(),
-                    "0.1.4-rc.2".to_owned(),
-                    "0.1.4-rc.1".to_owned(),
+                    RecentVersion {
+                        version: "0.1.5-rc.2".to_owned(),
+                        installed_at: Some("2026-10-03T00:00:00Z".to_owned()),
+                    },
+                    RecentVersion {
+                        version: "0.1.5-rc.1".to_owned(),
+                        installed_at: Some("2026-10-02T00:00:00Z".to_owned()),
+                    },
+                    RecentVersion::bare("0.1.5-alpha.2"),
+                    RecentVersion::bare("0.1.4-rc.3"),
+                    RecentVersion::bare("0.1.4-rc.2"),
+                    RecentVersion::bare("0.1.4-rc.1"),
                 ],
                 installed_version: Some("0.1.5-rc.2".to_owned()),
                 ..running.clone()
@@ -988,12 +1113,12 @@ pub fn dump_scenarios() -> Vec<(&'static str, MenuState)> {
             "recent-versions-installed-not-listed",
             MenuState {
                 recent_versions: vec![
-                    "0.1.6-rc.1".to_owned(),
-                    "0.1.5-rc.2".to_owned(),
-                    "0.1.5-rc.1".to_owned(),
-                    "0.1.5-alpha.2".to_owned(),
-                    "0.1.4-rc.3".to_owned(),
-                    "0.1.4-rc.2".to_owned(),
+                    RecentVersion::bare("0.1.6-rc.1"),
+                    RecentVersion::bare("0.1.5-rc.2"),
+                    RecentVersion::bare("0.1.5-rc.1"),
+                    RecentVersion::bare("0.1.5-alpha.2"),
+                    RecentVersion::bare("0.1.4-rc.3"),
+                    RecentVersion::bare("0.1.4-rc.2"),
                 ],
                 installed_version: Some("0.1.3-rc.1".to_owned()),
                 harness_version: Some("0.1.3-rc.1".to_owned()),
@@ -1241,6 +1366,60 @@ impl MenuRuntime {
         inner.state.harness_pid = snapshot.pid;
         inner.state.last_error = snapshot.last_error.clone();
         true
+    }
+
+    /// Applies the installed-version list. True when the menu's view of it changed.
+    ///
+    /// WHY THIS IS A SEPARATE GUARD, AND WHY IT IS NOT OPTIONAL. `update_harness`
+    /// returns `false` whenever its four fields are unchanged, and the watcher only
+    /// asks for a rebuild when SOMETHING reports a change. Without this second guard
+    /// a version list that changed while the harness did not - which is exactly what
+    /// an install or a delete is - would never reach `rebuild_menu` at all: the
+    /// submenu would silently never populate, and no error would be logged. That is
+    /// 2B's version of the "computed but never applied" bug this phase keeps meeting.
+    ///
+    /// COMPARED BY CONTENT, NOT BY REFERENCE. The payload is rebuilt on every poll, so
+    /// `recent_versions` is a fresh `Vec` each time; a reference or pointer comparison
+    /// would report "different" every 5 seconds and trigger a full structural rebuild
+    /// (~37 ms) forever. `Vec<RecentVersion>` derives `PartialEq` and each field is a
+    /// `String`/`Option<String>`, so this is an element-wise content comparison.
+    ///
+    /// ONLY THE VERSION STRINGS ARE COMPARED, and that is the second half of the same
+    /// concern: `installed_at` is NOT rendered by the submenu, so a catalogue rewrite
+    /// that moved dates without moving the list would trigger a 37 ms rebuild for a
+    /// menu that looks identical. Comparing what is DISPLAYED is what keeps the guard
+    /// honest in both directions - it fires when the menu would change, and not
+    /// otherwise. (`installed_at` is still stored, for Phase 3's version table.)
+    pub fn update_library(&self, snapshot: &HarnessSnapshot) -> bool {
+        let mut inner = self.lock();
+
+        let same = inner.state.recent_versions.len() == snapshot.recent_versions.len()
+            && inner
+                .state
+                .recent_versions
+                .iter()
+                .zip(snapshot.recent_versions.iter())
+                .all(|(current, next)| current.version == next.version);
+        if same {
+            return false;
+        }
+
+        inner.state.recent_versions = snapshot.recent_versions.clone();
+        true
+    }
+
+    /// Applies a whole snapshot: harness facts AND the version list.
+    ///
+    /// The ONE entry point the watcher and the control commands should call, so a
+    /// caller cannot remember one guard and forget the other. Returns true when
+    /// anything the menu renders changed.
+    pub fn update_snapshot(&self, snapshot: &HarnessSnapshot) -> bool {
+        // Both are evaluated: `|` rather than `||`, because short-circuiting would
+        // skip the library update whenever the harness facts moved too - and the two
+        // are independent facts about different parts of the menu.
+        let harness = self.update_harness(snapshot);
+        let library = self.update_library(snapshot);
+        harness | library
     }
 
     /// Applies the settings the menu renders. True when it changed.
@@ -1652,6 +1831,39 @@ pub fn rebuild_menu<R: Runtime>(app: &AppHandle<R>, reason: RebuildReason) -> Re
         };
     }
 
+    // WHICH WINDOWS THE APP-WIDE ATTACH ACTUALLY REACHED, MEASURED BY MENU IDENTITY.
+    //
+    // `AppHandle::set_menu` iterates the window map and attaches only where
+    // `has_app_wide_menu() || menu().is_none()` holds. `has_app_wide_menu` is
+    // `pub(crate)` in tauri, so it CANNOT be read from here - but its EFFECT can, and
+    // more directly: compare the id of the menu a window holds with the id of the menu
+    // that was just installed app-wide.
+    //
+    //   app_wide:<id>   the window received this rebuild's menu
+    //   OTHER:<id>      the window holds a DIFFERENT menu, so the attach SKIPPED it
+    //   none            the window has no menu at all
+    //
+    // This is the diagnostic that names the "harness window has no menu bar after a
+    // switch" bug without guessing at the flag: a window reported as OTHER is one that
+    // will keep a stale menu forever, because nothing else in the app sets one.
+    let installed_id = app.menu().map(|menu| menu.id().clone());
+    let mut reached: Vec<String> = Vec::new();
+    for (label, window) in app.webview_windows() {
+        let state = match window.menu() {
+            Some(menu) if Some(menu.id()) == installed_id.as_ref() => format!("app_wide:{}", menu.id().as_ref()),
+            Some(menu) => format!("OTHER:{}", menu.id().as_ref()),
+            None => "none".to_owned(),
+        };
+        reached.push(format!("{label}={state}"));
+    }
+    reached.sort();
+    log_line(&format!("menu app-wide attach: {}", reached.join(" ")));
+    if reached.iter().any(|entry| entry.contains("=OTHER:") || entry.ends_with("=none")) {
+        // Named loudly, because it is the difference between "this window has the menu"
+        // and "this window will never be updated again".
+        log_line("menu: WARNING - a window did not receive the app-wide menu; it will keep a stale menu");
+    }
+
     // C1 part B. `AppHandle::set_menu` is app-wide and attaches to every window
     // that has none, so this very call just handed the menu bar BACK to the
     // first-run wizard if it is open - and the wizard deliberately has no menu
@@ -1955,10 +2167,12 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
         // Pure window management: no network, no disk, no process spawn.
         MenuAction::OpenControlPanel { tab } => open_control_panel(app, tab, None),
 
-        // Forwarded to the dashboard. Emitting an event is not I/O, so these run
-        // inline and the handler still returns immediately.
-        MenuAction::RestartHarness => deliver(app, DashboardAction::Restart),
-        MenuAction::StopHarness => deliver(app, DashboardAction::Stop),
+        // Q99: harness actions dispatch SIDECAR-SIDE, unconditionally - see the block
+        // comment on `menu_dispatch`. A menu item that does nothing when the dashboard
+        // is closed is worse than the scope expansion, and the dashboard recovers its
+        // state from the status poll, which now runs continuously (Q95's fix).
+        MenuAction::RestartHarness => restart_harness(app),
+        MenuAction::StopHarness => stop_harness(app),
 
         // Emitted for consistency with every other actionable item, AND performed
         // here: revealing a folder has no state that could drift, so a dashboard
@@ -1987,11 +2201,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
             });
         }
 
-        MenuAction::SwitchVersion(version) => notice(
-            app,
-            PanelTab::Versions,
-            format!("Switching to v{version} arrives with the version library (Phase 2)."),
-        ),
+        MenuAction::SwitchVersion(version) => switch_version(app, version),
         MenuAction::HarnessUpdate => notice(
             app,
             PanelTab::Harness,
@@ -2023,6 +2233,366 @@ fn deliver<R: Runtime>(app: &AppHandle<R>, action: DashboardAction) {
     let request = MenuActionRequest { action };
     if let Err(error) = app.emit_to(MAIN_WINDOW_LABEL, EVENT_MENU_ACTION, request) {
         log_line(&format!("menu: could not emit {EVENT_MENU_ACTION}: {error}"));
+    }
+}
+
+// --- The switch: the ONE action that does not route through the dashboard -----
+//
+// Q74, EXTENDED IN 2B TO EVERY HARNESS ACTION (Q99).
+//
+// `Stop`, `Restart` and `Switch` all dispatch straight to the sidecar on a worker
+// thread, UNCONDITIONALLY - not only when the dashboard happens to be closed. The
+// earlier rule ("menu items forward their intent, and the dashboard performs it")
+// assumed a fast action performed by a surface that is always there. Neither holds:
+// the control panel is a window the user is expected to close, and a menu item that
+// does NOTHING when clicked is the worst available outcome - worse than the scope
+// expansion, and worse than a disabled item, which at least shows intent.
+//
+// The rule it replaces was stated as "one implementation per action, reached from two
+// entry points". That is still true, and now true in BOTH directions: the SAME sidecar
+// route serves the menu and the dashboard's button, so the dashboard is OPTIONAL for
+// every harness action rather than required.
+//
+// The dashboard recovers its state from the status poll, which after the Bug 1 fix runs
+// continuously - so a stop or a restart it did not perform is reflected within one idle
+// cadence. That fix is what makes this expansion safe; without a steady poll, moving
+// these actions off the dashboard would have left the card stale instead.
+//
+// `SwitchVersion` alone keeps its own entry point, because it validates a version name
+// first; `Stop` and `Restart` take no argument.
+
+/// What a menu-driven harness action should do, decided without touching the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchDispatch {
+    /// Ask the sidecar for this route. Runs on a worker thread.
+    Dispatch(String),
+    /// Refuse, with the message the user is shown.
+    Unavailable(String),
+}
+
+/// The routes the menu's harness actions reach.
+pub mod menu_routes {
+    /// `POST /harness/stop`.
+    pub const STOP: &str = "/harness/stop";
+    /// `POST /harness/restart`.
+    pub const RESTART: &str = "/harness/restart";
+}
+
+/// Decides whether a harness action can be dispatched, and to where.
+///
+/// PURE, so every refusal is unit-testable without a window, a sidecar or a menu. The
+/// dead-sidecar case is decided here for all three actions (Q91): when the sidecar never
+/// came up, or has not reported its port yet, the click cannot become an HTTP call at
+/// all, and the shell's recorded startup error is shown rather than a generic message -
+/// it names the actual cause (a missing `sidecar/index.js`, for instance), which is the
+/// same reason `ProxiedResponse` carries `shellError`.
+pub fn action_dispatch(
+    route: &str,
+    action_label: &str,
+    port: Option<u16>,
+    shell_error: Option<&str>,
+) -> SwitchDispatch {
+    if port.is_none() {
+        return match shell_error.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(error) => SwitchDispatch::Unavailable(format!(
+                "Cannot {action_label}: the DSH-Dock core is not running, so there is nothing to \
+                 reach. {error}"
+            )),
+            None => SwitchDispatch::Unavailable(format!(
+                "Cannot {action_label}: the DSH-Dock core has not reported a port yet. If this \
+                 persists, the core failed to start - check the launcher log."
+            )),
+        };
+    }
+
+    SwitchDispatch::Dispatch(route.to_owned())
+}
+
+/// Decides what a switch click should do, given what the shell knows.
+///
+/// The switch is `action_dispatch` plus ONE thing the other two do not need: the target
+/// version must be a name that could address a directory in the library, so a malformed
+/// menu id never becomes an HTTP request and the user gets the reason rather than a 400
+/// from a service they did not know was involved.
+pub fn switch_dispatch(
+    version: &str,
+    port: Option<u16>,
+    shell_error: Option<&str>,
+) -> SwitchDispatch {
+    if !is_switchable_version(version) {
+        return SwitchDispatch::Unavailable(format!(
+            "Cannot switch to {version:?}: it is not an exact version, so it cannot name a version \
+             in the library. Expected something like \"0.2.0-rc.2\"."
+        ));
+    }
+
+    if port.is_none() {
+        return match shell_error.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(error) => SwitchDispatch::Unavailable(format!(
+                "Cannot switch to v{version}: the DSH-Dock core is not running, so there is nothing \
+                 to switch. {error}"
+            )),
+            None => SwitchDispatch::Unavailable(format!(
+                "Cannot switch to v{version}: the DSH-Dock core has not reported a port yet. \
+                 If this persists, the core failed to start - check the launcher log."
+            )),
+        };
+    }
+
+    SwitchDispatch::Dispatch(format!("/versions/switch?version={version}"))
+}
+
+/// Mirrors `sidecar/lib/library.js`'s `isSafeVersionName`.
+///
+/// The sidecar validates this again and is the authority - this copy exists so a
+/// malformed menu id cannot become an HTTP request, and so the user gets the reason
+/// rather than a 400 from a service they did not know was involved. It is
+/// deliberately the same shape the sidecar enforces: an exact version, optionally
+/// with a pre-release AND a build suffix, either or both.
+///
+/// WHY THE FIRST VERSION OF THIS WAS WRONG. It split the string once on `-` or `+`,
+/// which handled `1.2.3-rc.1` and `1.2.3+build.5` but refused
+/// `1.2.3-rc.1+build.5` - a version with BOTH, which is legal and which the
+/// pre-release and build identifier grammars explicitly allow together. The suffix
+/// is therefore split at the FIRST `-` and then at the FIRST `+` after it, and each
+/// part is checked separately.
+fn is_switchable_version(version: &str) -> bool {
+    if version.is_empty() || version.len() > 128 {
+        return false;
+    }
+
+    // Split off build metadata first (`+` cannot appear before it in a valid version),
+    // then the pre-release, leaving the bare release.
+    let (before_build, build) = match version.split_once('+') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (version, None),
+    };
+    let (release, pre) = match before_build.split_once('-') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (before_build, None),
+    };
+
+    let identifier = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+    };
+
+    // The release: exactly three dot-separated numeral-only components.
+    let numbers: Vec<&str> = release.split('.').collect();
+    if numbers.len() != 3
+        || !numbers
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+
+    // A pre-release may not contain `+` (already split off) and must be a real
+    // identifier sequence; the same for build metadata.
+    pre.is_none_or(identifier) && build.is_none_or(identifier)
+}
+
+/// Runs one menu action's HTTP request. WORKER THREAD ONLY - no UI work here.
+///
+/// Kept as the single request hop every menu-dispatched action goes through, so there
+/// is ONE place that talks to the sidecar from a worker rather than four. The name says
+/// what it may do and, by omission, what it may not.
+fn run_menu_request<R: Runtime>(app: &AppHandle<R>, path: &str) -> crate::ProxiedResponse {
+    crate::proxy_control_app(app, "POST", path)
+}
+
+/// Decides, dispatches and reports for one menu action.
+///
+/// THE SHARED SHAPE FOR ALL THREE HARNESS ACTIONS (Q99). `switch_version`, `stop_harness`
+/// and `restart_harness` differ only in the route, the wording, and whether a version
+/// name had to be validated first - so the threading boundary lives here once.
+///
+/// THREADING (section 2.8.3's rule, in BOTH directions):
+///
+///   * `handle_menu_event` runs ON THE MAIN THREAD. It must not block. A switch is
+///     minutes; a stop and a restart are seconds but still block on HTTP, and the main
+///     thread is where the menu itself lives, so even a fast request is marshalled off.
+///   * A WORKER MUST NOT TOUCH THE MENU. `set_menu`, `MenuItem::set_text`, window focus
+///     and `emit` are all main-thread work; calling them from a worker either silently
+///     does nothing or panics. The worker's ONLY job is the HTTP call, and everything
+///     visible is marshalled back with [`on_main`].
+///
+/// `test_only_probe` is the seam the worker-boundary tests use: they assert this
+/// function performs exactly one HTTP call and no menu work.
+fn run_menu_action<R, F>(
+    app: &AppHandle<R>,
+    dispatch: SwitchDispatch,
+    panel: PanelTab,
+    worker_name: &str,
+    detail: String,
+    outcome: F,
+) where
+    R: Runtime,
+    F: FnOnce(&crate::ProxiedResponse) -> String + Send + 'static,
+{
+    match dispatch {
+        // Nothing to do on a worker: there is no HTTP request to make. Reported through
+        // the SAME channel every other refusal uses, so a dead sidecar always produces a
+        // sentence rather than silence.
+        SwitchDispatch::Unavailable(message) => notice(app, panel, message),
+        SwitchDispatch::Dispatch(path) => {
+            log_line(&format!("menu: {detail} (sidecar {path})"));
+            let handle = app.clone();
+            spawn_worker(app, worker_name, move |worker_app| {
+                // The worker does the HTTP hop and NOTHING else.
+                let response = run_menu_request(&worker_app, &path);
+                let message = outcome(&response);
+                on_main(&handle, move |app| {
+                    log_line(&format!("menu: {detail}: {message}"));
+                    // The action changed the harness's state, so the status label and the
+                    // recent list both need re-reading. Asking for a rebuild re-runs
+                    // `menu_plan` from the state the watcher will refresh, and the gate
+                    // drops it if nothing moved.
+                    request_rebuild(app, RebuildReason::StatusChange);
+                    open_control_panel(app, panel, Some(message));
+                });
+            });
+        }
+    }
+}
+
+/// Performs a switch from the menu: decide, dispatch on a worker, report on main.
+fn switch_version<R: Runtime>(app: &AppHandle<R>, version: String) {
+    let (port, shell_error) = match app.try_state::<crate::SidecarState>() {
+        Some(state) => (state.port_now(), state.error()),
+        None => (None, None),
+    };
+
+    let dispatch = switch_dispatch(&version, port, shell_error.as_deref());
+    let for_message = version.clone();
+    run_menu_action(
+        app,
+        dispatch,
+        PanelTab::Versions,
+        "dsh-dock-menu-switch",
+        format!("switching to v{version}"),
+        move |response| switch_outcome_message(&for_message, response),
+    );
+}
+
+/// Performs a stop from the menu.
+fn stop_harness<R: Runtime>(app: &AppHandle<R>) {
+    let dispatch = harness_action_dispatch(app, menu_routes::STOP, "stop the harness");
+    run_menu_action(
+        app,
+        dispatch,
+        PanelTab::Harness,
+        "dsh-dock-menu-stop",
+        "stopping the harness".to_owned(),
+        harness_action_outcome,
+    );
+}
+
+/// Performs a restart from the menu.
+///
+/// A restart is `stop` then `start` on the sidecar's own route, so this needs no
+/// sequencing here even though the dashboard's button deliberately calls the two halves
+/// separately to keep its own state in step - the sidecar's `/harness/restart` is
+/// literally those two calls, and the menu has no per-half state to keep.
+fn restart_harness<R: Runtime>(app: &AppHandle<R>) {
+    let dispatch = harness_action_dispatch(app, menu_routes::RESTART, "restart the harness");
+    run_menu_action(
+        app,
+        dispatch,
+        PanelTab::Harness,
+        "dsh-dock-menu-restart",
+        "restarting the harness".to_owned(),
+        harness_action_outcome,
+    );
+}
+
+/// Reads the sidecar facts and decides, for a parameterless harness action.
+fn harness_action_dispatch<R: Runtime>(
+    app: &AppHandle<R>,
+    route: &str,
+    label: &str,
+) -> SwitchDispatch {
+    let (port, shell_error) = match app.try_state::<crate::SidecarState>() {
+        Some(state) => (state.port_now(), state.error()),
+        None => (None, None),
+    };
+    action_dispatch(route, label, port, shell_error.as_deref())
+}
+
+/// Turns a stop/restart response into the one line the user is shown.
+///
+/// PURE, so all three outcomes are testable without an app: the sidecar's own message
+/// when it gave one, the shell error when the sidecar could not be reached, and an
+/// explicit note when a 2xx arrived with no body to quote.
+fn harness_action_outcome(response: &crate::ProxiedResponse) -> String {
+    let sidecar_message = response
+        .data
+        .get("message")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(error) = response.error.as_deref() {
+        return match response.shell_error.as_deref() {
+            Some(shell) if !shell.trim().is_empty() => format!("{error} ({shell})"),
+            _ => error.to_owned(),
+        };
+    }
+
+    match sidecar_message {
+        // The sidecar's own wording is more specific than anything the shell could
+        // invent ("Harness stopped." vs "No running harness to stop."), so it is used
+        // verbatim.
+        Some(message) => message.to_owned(),
+        None => match response.code {
+            200..=299 => "The DSH-Dock core accepted the request, but returned no message.".to_owned(),
+            _ => format!("The DSH-Dock core answered HTTP {} with no explanation.", response.code),
+        },
+    }
+}
+
+/// Turns a switch response into the one line the user is shown.
+///
+/// Split out and pure so the three outcomes - accepted, refused with a body, and
+/// the sidecar being unreachable - are unit-testable without an app. The
+/// distinction matters: "202 accepted" is not "switched", and a refusal carries the
+/// sidecar's own explanation (another operation in flight, or the library locked by
+/// a process outside this launcher).
+fn switch_outcome_message(version: &str, response: &crate::ProxiedResponse) -> String {
+    if let Some(error) = response.error.as_deref() {
+        return match response.shell_error.as_deref() {
+            Some(shell) if !shell.trim().is_empty() => {
+                format!("Could not start switching to v{version}: {error} ({shell})")
+            }
+            _ => format!("Could not start switching to v{version}: {error}"),
+        };
+    }
+
+    let sidecar_message = response
+        .data
+        .get("message")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match response.code {
+        202 => format!(
+            "Switching to v{version}. The harness stops and starts again, so this can take a few \
+             minutes; the version list refreshes when it finishes."
+        ),
+        // 409 is the documented refusal (another operation in flight, or the
+        // library locked). The sidecar's own wording is more specific than anything
+        // the shell could invent, so it is used verbatim when present.
+        _ => match sidecar_message {
+            Some(message) => format!("Could not switch to v{version}: {message}"),
+            None => format!(
+                "Could not switch to v{version}: the DSH-Dock core answered HTTP {} with no \
+                 explanation.",
+                response.code
+            ),
+        },
     }
 }
 
@@ -2703,16 +3273,40 @@ mod tests {
     // --- recent versions --------------------------------------------------
 
     #[test]
-    fn recent_versions_contains_only_the_disabled_phase_2_hint_when_empty() {
+    fn recent_versions_contains_only_the_manager_entry_when_the_library_is_empty() {
         let plan = menu_plan(&state_for("running"), TargetOs::Windows);
         let items = nested(submenu(&plan, "Harness"), "Recent Versions");
 
         assert_eq!(items.len(), 1, "{items:#?}");
         let show_all = &items[0];
-        assert_eq!(node_label(show_all), "Show all versions… (Phase 2)");
+        // PHASE 2B CHANGED THIS ASSERTION, and the change is the point of the phase.
+        // It used to read "Show all versions… (Phase 2)" and require `enabled: false`,
+        // because the version manager did not exist. It does now: the dashboard has a
+        // version section and the sidecar serves `/versions/status` behind it. So the
+        // label loses the phase suffix and the entry becomes clickable.
+        assert_eq!(node_label(show_all), "Show all versions…");
         assert!(
-            matches!(show_all, PlanNode::Action { enabled: false, .. }),
-            "the version manager does not exist yet, so the entry must not pretend it does: {show_all:?}"
+            matches!(show_all, PlanNode::Action { enabled: true, .. }),
+            "the version manager exists as of 2B, so the entry must be clickable: {show_all:?}"
+        );
+        assert!(
+            matches!(
+                show_all,
+                PlanNode::Action {
+                    action: MenuAction::OpenControlPanel {
+                        tab: PanelTab::Versions
+                    },
+                    ..
+                }
+            ),
+            "the entry must open the version section, not just the panel: {show_all:?}"
+        );
+        // An empty library still gets the entry: with nothing installed, "Show all
+        // versions…" is the only route to the download UI.
+        assert_eq!(
+            state_for("running").recent_versions.len(),
+            0,
+            "this fixture is meant to have an empty library"
         );
     }
 
@@ -2724,26 +3318,72 @@ mod tests {
         let items = nested(submenu(&plan, "Harness"), "Recent Versions");
 
         assert_eq!(items.len(), 6, "five versions plus Show all versions…: {items:#?}");
-        assert_eq!(node_label(&items[0]), "v0.1.5-rc.2 (installed)");
+        // PHASE 2B (Q100) REMOVED THE `(installed)` SUFFIX. The running version is now
+        // marked with a native CHECK instead, and the suffix was noise: every entry in
+        // this list is installed by definition, since it is enumerated from the library.
+        assert_eq!(node_label(&items[0]), "v0.1.5-rc.2");
         assert_eq!(node_label(&items[1]), "v0.1.5-rc.1");
         assert_eq!(node_label(&items[4]), "v0.1.4-rc.2");
-        assert_eq!(node_label(&items[5]), "Show all versions… (Phase 2)");
+        assert_eq!(node_label(&items[5]), "Show all versions…");
 
         let labels: Vec<&str> = items.iter().map(node_label).collect();
         assert!(
             !labels.contains(&"v0.1.4-rc.1"),
             "the sixth version must be dropped: {labels:?}"
         );
+
+        // THE STATE KEEPS ALL SIX even though the submenu shows five. That split is
+        // what "Show all versions…" depends on: the manager must open with the sixth
+        // version available, not merely the five the menu happened to display.
+        assert_eq!(
+            state.recent_versions.len(),
+            6,
+            "the state must keep the whole library: {:#?}",
+            state.recent_versions
+        );
     }
 
     #[test]
-    fn the_installed_version_is_information_and_the_others_are_switch_actions() {
+    fn the_running_version_is_checked_and_the_others_are_switch_actions() {
         let plan = menu_plan(&state_for("recent-versions"), TargetOs::Windows);
         let items = nested(submenu(&plan, "Harness"), "Recent Versions");
 
-        // The installed entry is a label: switching to the running version is a
-        // no-op, so it must not be clickable.
-        assert!(matches!(&items[0], PlanNode::Label { .. }));
+        // THE RUNNING VERSION IS A CHECK ITEM, checked and not clickable (Q100).
+        //
+        // Disabled because switching to the version already running is NOT a no-op: the
+        // sidecar stops the harness and starts it again, so a click would restart a
+        // working harness for nothing. The tick is information.
+        match &items[0] {
+            PlanNode::Check {
+                id,
+                checked,
+                enabled,
+                action,
+                ..
+            } => {
+                assert!(*checked, "the running version must be ticked: {id}");
+                assert!(
+                    !*enabled,
+                    "and must not be clickable, or a click restarts a working harness: {id}"
+                );
+                // The id still round-trips: the tick must not cost the item its identity,
+                // because `every_action_id_in_every_plan_round_trips` walks the plan and
+                // a `Check` whose id did not parse would be a dead entry.
+                assert_eq!(MenuAction::from_id(id).as_ref(), Some(action), "{id}");
+            }
+            other => panic!("expected a checked item for the running version, got {other:?}"),
+        }
+
+        // And EXACTLY ONE entry is checked, which is the assertion that catches a mark
+        // applied to the wrong node.
+        let checked: Vec<&str> = items
+            .iter()
+            .filter_map(|node| match node {
+                PlanNode::Check { label, checked: true, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checked, vec!["v0.1.5-rc.2"], "exactly one tick: {checked:?}");
 
         for node in &items[1..5] {
             match node {
@@ -2755,6 +3395,122 @@ mod tests {
                 other => panic!("expected a switch action, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn the_tick_moves_when_the_running_version_changes() {
+        // The regression this catches: a mark computed from a field that never updates,
+        // or baked into the label so it cannot move.
+        let base = state_for("recent-versions");
+
+        let running_rc2 = MenuState {
+            installed_version: Some("0.1.5-rc.2".to_owned()),
+            ..base.clone()
+        };
+        let running_rc1 = MenuState {
+            installed_version: Some("0.1.5-rc.1".to_owned()),
+            ..base.clone()
+        };
+
+        let checked_in = |state: &MenuState| -> Vec<String> {
+            let plan = menu_plan(state, TargetOs::Windows);
+            nested(submenu(&plan, "Harness"), "Recent Versions")
+                .iter()
+                .filter_map(|node| match node {
+                    PlanNode::Check { label, checked: true, .. } => Some(label.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        assert_eq!(checked_in(&running_rc2), vec!["v0.1.5-rc.2".to_owned()]);
+        assert_eq!(
+            checked_in(&running_rc1),
+            vec!["v0.1.5-rc.1".to_owned()],
+            "the tick must follow the running version, not stay where it was"
+        );
+
+        // The version that LOST the tick must be clickable again - otherwise the mark
+        // would move while the disabled state stayed behind.
+        let plan = menu_plan(&running_rc1, TargetOs::Windows);
+        let items = nested(submenu(&plan, "Harness"), "Recent Versions");
+        assert!(
+            items.iter().any(|node| matches!(
+                node,
+                PlanNode::Action { id, enabled: true, .. }
+                    if id == "harness.recent.0.1.5-rc.2"
+            )),
+            "the previously-running version must be switchable again: {items:#?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_ticked_when_nothing_is_running() {
+        let state = MenuState {
+            harness_status: HarnessStatus::Stopped,
+            harness_version: None,
+            installed_version: None,
+            ..state_for("recent-versions")
+        };
+
+        let plan = menu_plan(&state, TargetOs::Windows);
+        let items = nested(submenu(&plan, "Harness"), "Recent Versions");
+
+        assert!(
+            !items
+                .iter()
+                .any(|node| matches!(node, PlanNode::Check { checked: true, .. })),
+            "a stopped harness must leave every entry unticked: {items:#?}"
+        );
+        // And every version is still clickable - with nothing running, nothing is
+        // information-only.
+        let ids: Vec<&str> = items
+            .iter()
+            .filter_map(|node| match node {
+                PlanNode::Action { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        for version in [
+            "0.1.5-rc.2",
+            "0.1.5-rc.1",
+            "0.1.5-alpha.2",
+            "0.1.4-rc.3",
+            "0.1.4-rc.2",
+        ] {
+            assert!(
+                ids.contains(&format!("harness.recent.{version}").as_str()),
+                "{version} must be switchable with nothing running: {ids:?}"
+            );
+        }
+        assert!(
+            ids.contains(&ID_HARNESS_SHOW_ALL_VERSIONS),
+            "the manager entry must still be an action: {ids:?}"
+        );
+        assert_eq!(ids.len(), 6, "five versions plus the manager entry: {ids:?}");
+    }
+
+    #[test]
+    fn a_running_version_outside_the_shown_five_ticks_nothing_but_stays_findable() {
+        // Designated in the fixture: the running version has aged out of the five most
+        // recent. There is no entry to tick, so nothing may appear ticked - a tick on a
+        // DIFFERENT version would be a lie about which one is running.
+        let state = state_for("recent-versions-installed-not-listed");
+        assert_eq!(state.installed_version.as_deref(), Some("0.1.3-rc.1"));
+
+        let plan = menu_plan(&state, TargetOs::Windows);
+        let items = nested(submenu(&plan, "Harness"), "Recent Versions");
+
+        assert!(
+            !items
+                .iter()
+                .any(|node| matches!(node, PlanNode::Check { checked: true, .. })),
+            "nothing may be ticked when the running version is not listed: {items:#?}"
+        );
+        assert!(
+            !items.iter().any(|node| node_label(node).contains("0.1.3")),
+            "the running version must not be smuggled into the five: {items:#?}"
+        );
     }
 
     #[test]
@@ -2785,10 +3541,14 @@ mod tests {
         for node in &items[..5] {
             assert!(matches!(node, PlanNode::Action { enabled: true, .. }), "{node:?}");
         }
-        assert_eq!(labels[5], "Show all versions… (Phase 2)");
+        assert_eq!(labels[5], "Show all versions…");
         assert!(matches!(
             &items[5],
-            PlanNode::Action { action: MenuAction::OpenControlPanel { tab: PanelTab::Versions }, .. }
+            PlanNode::Action {
+                action: MenuAction::OpenControlPanel { tab: PanelTab::Versions },
+                enabled: true,
+                ..
+            }
         ));
     }
 
@@ -3265,13 +4025,16 @@ mod tests {
     #[test]
     fn only_the_actions_that_touch_the_world_use_a_worker() {
         // Step C, R1: menu events arrive on the main thread, which also pumps
-        // both webviews. Anything that spawns a process or writes a file must be
-        // moved to a worker, and the dispatcher's structure depends on this list
-        // being exactly right.
+        // both webviews. Anything that spawns a process, writes a file, or makes an HTTP
+        // call must be moved to a worker, and the dispatcher's structure depends on this
+        // list being exactly right.
         //
-        // Since the dashboard took over the harness actions, Restart and Stop no
-        // longer touch the sidecar from here at all: they emit an event. That is
-        // why they are no longer worker actions.
+        // PHASE 2B (Q99) CHANGED THIS LIST. Restart, Stop and Switch now dispatch to the
+        // sidecar from the shell - unconditionally, so a menu click works with the
+        // dashboard closed - which makes all three HTTP calls and therefore all three
+        // worker actions. The earlier version of this test expected exactly two workers
+        // precisely BECAUSE the harness actions went through the dashboard; that is the
+        // assumption the acceptance run disproved.
         let actions = vec![
             MenuAction::RestartHarness,
             MenuAction::StopHarness,
@@ -3294,7 +4057,12 @@ mod tests {
         for action in &actions {
             let expected_worker = matches!(
                 action,
-                MenuAction::OpenLogsFolder | MenuAction::SetAutoUpdateChannel(_)
+                MenuAction::OpenLogsFolder
+                    | MenuAction::SetAutoUpdateChannel(_)
+                    // Q99: the three harness actions reach the sidecar over HTTP.
+                    | MenuAction::RestartHarness
+                    | MenuAction::StopHarness
+                    | MenuAction::SwitchVersion(_)
             );
             assert_eq!(
                 action.needs_worker(),
@@ -3303,10 +4071,21 @@ mod tests {
             );
         }
 
-        // Exactly two worker actions, and they are the two I/O ones.
+        // Exactly five worker actions: the three harness actions, the logs spawn, and
+        // the settings write.
         let workers: Vec<&MenuAction> =
             actions.iter().filter(|action| action.needs_worker()).collect();
-        assert_eq!(workers.len(), 2, "{workers:?}");
+        assert_eq!(workers.len(), 5, "{workers:?}");
+
+        // And the ones that must stay on the main thread are window management alone.
+        for action in &actions {
+            if matches!(action, MenuAction::OpenControlPanel { .. }) {
+                assert!(
+                    !action.needs_worker(),
+                    "{action:?} is window management and must stay main-thread"
+                );
+            }
+        }
     }
 
     // --- the dashboard action channel -------------------------------------
@@ -3334,38 +4113,290 @@ mod tests {
     }
 
     #[test]
-    fn the_harness_actions_are_forwarded_rather_than_performed_here() {
-        // The regression this guards: the menu used to call the sidecar itself,
-        // so a menu "Stop Harness" left the dashboard showing a running harness.
-        // Each of these ids must resolve to an action that only EMITS.
+    fn the_harness_actions_dispatch_sidecar_side_rather_than_through_the_dashboard() {
+        // Q99 REPLACED THE EARLIER RULE HERE, and this test is the record of it.
         //
-        // OpenLogsFolder is the deliberate exception (section 3.8, Q58): it has no
-        // dashboard state to keep in step, so the shell reveals the folder itself.
-        // That makes it a worker action, and asserting "no I/O" on it here would
-        // contradict `needs_worker` and the dispatcher. Its worker classification
-        // is asserted by the sibling test for the two-worker set; this test covers
-        // the actions that are forwarded ONLY.
-        for (id, expected) in [
-            (ID_HARNESS_RESTART, DashboardAction::Restart),
-            (ID_HARNESS_STOP, DashboardAction::Stop),
-        ] {
+        // The previous version asserted the opposite - that Restart and Stop were
+        // FORWARDED to the dashboard and therefore needed no worker. That was correct
+        // while the dashboard was assumed to be open. The acceptance run showed the cost:
+        // with the dashboard closed, a menu Stop or Restart logged "could not deliver"
+        // and did nothing at all.
+        //
+        // Now all three harness actions reach the sidecar directly, so all three are
+        // worker actions. `needs_worker` is the test seam for exactly this classification.
+        for id in [ID_HARNESS_RESTART, ID_HARNESS_STOP] {
             let action = MenuAction::from_id(id).expect("a known id");
             assert!(
-                !action.needs_worker(),
-                "{id} must not do I/O in the shell any more"
+                action.needs_worker(),
+                "{id} performs HTTP to the sidecar now, so it must run on a worker"
             );
-
-            // The mapping from menu action to dashboard action is the contract
-            // `handle_menu_event` implements; pin it here so a change to one
-            // without the other fails a test.
-            let forwarded = match action {
-                MenuAction::RestartHarness => Some(DashboardAction::Restart),
-                MenuAction::StopHarness => Some(DashboardAction::Stop),
-                MenuAction::OpenLogsFolder => Some(DashboardAction::OpenLogs),
-                _ => None,
-            };
-            assert_eq!(forwarded, Some(expected), "{id} forwards the wrong action");
         }
+        assert!(
+            MenuAction::SwitchVersion("0.2.0-rc.2".to_owned()).needs_worker(),
+            "the switch has always been a worker action"
+        );
+
+        // The two single-argument forms are classified by their payload, so a version
+        // that is not a version is still classified the same way - `needs_worker` is
+        // about the KIND of work, not about the argument's validity.
+        assert!(MenuAction::SetAutoUpdateChannel("rc".to_owned()).needs_worker());
+        assert!(MenuAction::OpenLogsFolder.needs_worker());
+
+        // And the actions that genuinely are main-thread-only stay that way.
+        for action in [
+            MenuAction::OpenControlPanel { tab: PanelTab::Harness },
+            MenuAction::HarnessUpdate,
+            MenuAction::DockUpdate,
+        ] {
+            assert!(!action.needs_worker(), "{action:?} must stay on the main thread");
+        }
+    }
+
+    #[test]
+    fn only_open_logs_is_still_forwarded_to_the_dashboard() {
+        // `deliver()` survives for the one action that genuinely belongs to the
+        // dashboard's own surface: revealing the logs folder is emitted for consistency,
+        // but the shell performs it too (Q58), so it has no dashboard state to keep in
+        // step. Every HARNESS action has left this path.
+        let dispatcher = production_function("handle_menu_event");
+        let delivered: Vec<&str> = dispatcher
+            .lines()
+            .filter(|line| line.contains("deliver("))
+            .map(str::trim)
+            .collect();
+
+        assert_eq!(
+            delivered.len(),
+            1,
+            "exactly one action may still go through the dashboard: {delivered:?}"
+        );
+        assert!(
+            delivered[0].contains("OpenLogs"),
+            "and it must be OpenLogs: {delivered:?}"
+        );
+    }
+
+    // --- Q99: the three harness actions dispatch sidecar-side -----------------
+
+    /// The body of a named function in the non-test half of `menu.rs`.
+    ///
+    /// Used by the worker-boundary tests, which have to inspect the shape of the
+    /// dispatch rather than run it: `spawn_worker` needs a live `AppHandle`, and the
+    /// property under test ("this code never touches the menu") is a property of the
+    /// SOURCE, not of a value it returns.
+    fn production_function(name: &str) -> String {
+        let source = include_str!("menu.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("menu.rs has a non-test section");
+        let start = production
+            .find(&format!("fn {name}<"))
+            .or_else(|| production.find(&format!("fn {name}(")))
+            .unwrap_or_else(|| panic!("function {name} exists"));
+        let rest = &production[start..];
+        let end = rest.find("\n}\n").unwrap_or(rest.len());
+        rest[..end].to_owned()
+    }
+
+    /// Every menu-touching or main-thread-only call in `menu.rs`, by name.
+    ///
+    /// A worker calling ANY of these either silently does nothing or panics, which is
+    /// the rule section 2.8.3 states in both directions. Listed in one place so a new
+    /// main-thread helper has to be considered here too.
+    const MENU_ONLY_CALLS: [&str; 6] = [
+        "set_menu",
+        "clear_welcome_menu",
+        "request_rebuild",
+        "open_control_panel",
+        "on_main",
+        "installed_item",
+    ];
+
+    #[test]
+    fn the_worker_hop_touches_no_menu_and_only_makes_the_request() {
+        // THE BOUNDARY, PINNED BY SOURCE SHAPE. Everything inside the closure
+        // `spawn_worker` is handed runs OFF the main thread, so the hop is allowed to do
+        // exactly one thing.
+        let hop = production_function("run_menu_request");
+        assert!(
+            hop.contains("proxy_control_app"),
+            "the worker hop must perform the HTTP call: {hop}"
+        );
+        for forbidden in MENU_ONLY_CALLS {
+            assert!(
+                !hop.contains(forbidden),
+                "the worker hop must not call {forbidden}: {hop}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_dispatched_action_marshals_its_result_back_to_the_main_thread() {
+        // The complement: the worker does the I/O, and everything VISIBLE happens inside
+        // `on_main`. Without this, a successful action would produce no visible change at
+        // all - the failure mode the whole Q74/Q99 design exists to avoid.
+        let shared = production_function("run_menu_action");
+        for required in ["spawn_worker", "run_menu_request", "on_main", "request_rebuild"] {
+            assert!(
+                shared.contains(required),
+                "the shared dispatch must call {required}: {shared}"
+            );
+        }
+        assert!(
+            shared.contains("SwitchDispatch::Unavailable"),
+            "and it must handle the refusal branch: {shared}"
+        );
+        // The main-thread work must be INSIDE the marshalled closure, not before it: a
+        // `request_rebuild` outside `on_main` would touch the menu from the worker.
+        let marshal = shared.find("on_main(").expect("on_main is called");
+        let rebuild = shared.find("request_rebuild").expect("request_rebuild is called");
+        assert!(
+            rebuild > marshal,
+            "the rebuild must be inside the marshalled closure: {shared}"
+        );
+    }
+
+    #[test]
+    fn stop_dispatches_to_the_sidecar_route_without_the_dashboard() {
+        // 1a: the decision.
+        assert_eq!(menu_routes::STOP, "/harness/stop");
+        assert_eq!(
+            action_dispatch(menu_routes::STOP, "stop the harness", Some(54321), None),
+            SwitchDispatch::Dispatch("/harness/stop".to_owned()),
+        );
+
+        let refused = action_dispatch(menu_routes::STOP, "stop the harness", None, None);
+        match refused {
+            SwitchDispatch::Unavailable(message) => {
+                assert!(message.contains("stop the harness"), "{message}");
+                assert!(message.contains("not reported a port yet"), "{message}");
+            }
+            other => panic!("a missing port must refuse: {other:?}"),
+        }
+
+        // 1b: the boundary. Stop goes through the shared dispatch rather than spawning its
+        // own worker, so there is ONE place that touches the menu.
+        let body = production_function("stop_harness");
+        assert!(body.contains("run_menu_action"), "{body}");
+        assert!(body.contains("menu_routes::STOP"), "{body}");
+        for forbidden in ["spawn_worker", "set_menu", "run_menu_request"] {
+            assert!(
+                !body.contains(forbidden),
+                "stop_harness must delegate {forbidden} to the shared helpers: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_dispatches_to_the_sidecar_route_without_the_dashboard() {
+        assert_eq!(menu_routes::RESTART, "/harness/restart");
+        assert_eq!(
+            action_dispatch(menu_routes::RESTART, "restart the harness", Some(54321), None),
+            SwitchDispatch::Dispatch("/harness/restart".to_owned()),
+        );
+
+        let refused = action_dispatch(
+            menu_routes::RESTART,
+            "restart the harness",
+            None,
+            Some("Could not find sidecar/index.js"),
+        );
+        match refused {
+            SwitchDispatch::Unavailable(message) => {
+                assert!(message.contains("restart the harness"), "{message}");
+                assert!(
+                    message.contains("Could not find sidecar/index.js"),
+                    "the shell's real reason must be shown: {message}"
+                );
+            }
+            other => panic!("a recorded shell error must refuse: {other:?}"),
+        }
+
+        let body = production_function("restart_harness");
+        assert!(body.contains("run_menu_action"), "{body}");
+        assert!(body.contains("menu_routes::RESTART"), "{body}");
+        for forbidden in ["spawn_worker", "set_menu", "run_menu_request"] {
+            assert!(
+                !body.contains(forbidden),
+                "restart_harness must delegate {forbidden} to the shared helpers: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn switch_dispatches_to_the_version_route_without_the_dashboard() {
+        assert_eq!(
+            switch_dispatch("0.2.0-rc.2", Some(54321), None),
+            SwitchDispatch::Dispatch("/versions/switch?version=0.2.0-rc.2".to_owned()),
+        );
+
+        // The switch keeps ONE thing the other two do not have: the version-name gate.
+        match switch_dispatch("next", Some(54321), None) {
+            SwitchDispatch::Unavailable(message) => {
+                assert!(message.contains("not an exact version"), "{message}");
+            }
+            other => panic!("a dist-tag must be refused before any request: {other:?}"),
+        }
+
+        let body = production_function("switch_version");
+        assert!(body.contains("run_menu_action"), "{body}");
+        assert!(body.contains("switch_dispatch"), "{body}");
+        for forbidden in ["spawn_worker", "set_menu", "run_menu_request"] {
+            assert!(
+                !body.contains(forbidden),
+                "switch_version must delegate {forbidden} to the shared helpers: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_harness_action_outcome_prefers_the_sidecars_own_wording() {
+        // Pure, so all the shapes are testable without an app. The sidecar's message is
+        // more specific than anything the shell could invent ("Harness stopped." vs "No
+        // running harness to stop."), so it is used verbatim.
+        let stopped = crate::ProxiedResponse {
+            code: 200,
+            data: serde_json::json!({ "status": "stopped", "message": "Harness stopped." }),
+            error: None,
+            shell_error: None,
+        };
+        assert_eq!(harness_action_outcome(&stopped), "Harness stopped.");
+
+        let noop = crate::ProxiedResponse {
+            code: 200,
+            data: serde_json::json!({ "status": "stopped", "message": "No running harness to stop." }),
+            error: None,
+            shell_error: None,
+        };
+        assert_eq!(harness_action_outcome(&noop), "No running harness to stop.");
+
+        let unreachable = crate::ProxiedResponse {
+            code: 0,
+            data: serde_json::Value::Null,
+            error: Some("Could not reach the DSH-Dock core on 127.0.0.1:54321".to_owned()),
+            shell_error: Some("Could not find sidecar/index.js".to_owned()),
+        };
+        let message = harness_action_outcome(&unreachable);
+        assert!(message.contains("Could not reach the DSH-Dock core"), "{message}");
+        assert!(message.contains("Could not find sidecar/index.js"), "{message}");
+
+        // A 2xx with no body must still say something, rather than producing an empty
+        // sentence in a dialog.
+        let silent = crate::ProxiedResponse {
+            code: 200,
+            data: serde_json::Value::Null,
+            error: None,
+            shell_error: None,
+        };
+        assert!(!harness_action_outcome(&silent).is_empty());
+        let unexplained = crate::ProxiedResponse {
+            code: 500,
+            data: serde_json::Value::Null,
+            error: None,
+            shell_error: None,
+        };
+        assert!(harness_action_outcome(&unexplained).contains("HTTP 500"));
     }
 
     // --- reading the harness status ---------------------------------------
@@ -3487,6 +4518,7 @@ mod tests {
             version: Some("0.1.5-rc.2".to_owned()),
             pid: Some(4242),
             last_error: None,
+            recent_versions: Vec::new(),
         };
 
         assert!(runtime.update_harness(&snapshot), "a first observation is a change");
@@ -3506,6 +4538,7 @@ mod tests {
             version: None,
             pid: None,
             last_error: None,
+            recent_versions: Vec::new(),
         };
         assert!(runtime.update_harness(&stopped));
         assert_eq!(runtime.snapshot().harness_status, HarnessStatus::Stopped);
@@ -3591,5 +4624,536 @@ mod tests {
         let (negative, warning) = poll_interval_from(Some("-100"));
         assert_eq!(negative, Duration::from_secs(5));
         assert!(warning.is_some());
+    }
+
+    // --- Phase 2B: the version list, and the switch the menu can start --------
+
+    #[test]
+    fn the_library_guard_compares_content_not_the_array_identity() {
+        let runtime = MenuRuntime::new(MenuState::default());
+
+        let list = vec![
+            RecentVersion {
+                version: "0.2.0-rc.2".to_owned(),
+                installed_at: Some("2026-10-06T18:37:06.147Z".to_owned()),
+            },
+            RecentVersion {
+                version: "0.2.0-rc.1".to_owned(),
+                installed_at: Some("2026-10-06T18:36:02.227Z".to_owned()),
+            },
+        ];
+
+        let snapshot = HarnessSnapshot {
+            status: HarnessStatus::Stopped,
+            version: None,
+            pid: None,
+            last_error: None,
+            recent_versions: list.clone(),
+        };
+
+        assert!(runtime.update_library(&snapshot), "the first list is a change");
+
+        // THE POINT OF THIS TEST. The payload is rebuilt on every 5s poll, so in
+        // production this is a FRESH Vec with equal contents. A reference or pointer
+        // comparison would report a change every poll and trigger a full structural
+        // rebuild (~37 ms) forever.
+        let rebuilt = HarnessSnapshot {
+            recent_versions: list.clone(),
+            ..snapshot.clone()
+        };
+        assert!(
+            !runtime.update_library(&rebuilt),
+            "an equal list in a DIFFERENT Vec must not count as a change"
+        );
+
+        // An entry added, removed, or REORDERED is a change: order is what the
+        // submenu renders, so a reordering genuinely changes the menu.
+        let mut extra = list.clone();
+        extra.push(RecentVersion::bare("0.1.9"));
+        assert!(runtime.update_library(&HarnessSnapshot {
+            recent_versions: extra,
+            ..snapshot.clone()
+        }));
+
+        let mut reordered = list.clone();
+        reordered.reverse();
+        assert!(
+            runtime.update_library(&HarnessSnapshot {
+                recent_versions: reordered,
+                ..snapshot.clone()
+            }),
+            "a reordering changes what the submenu shows"
+        );
+
+        // And back to the original, so the guard is not sticky in one direction only.
+        assert!(runtime.update_library(&snapshot));
+    }
+
+    #[test]
+    fn a_date_only_change_does_not_force_a_rebuild() {
+        // The second half of the same concern. `installed_at` is NOT rendered by the
+        // submenu, so a catalogue rewrite that moved dates without moving the list
+        // must not cost a 37 ms structural rebuild for a menu that looks identical.
+        let runtime = MenuRuntime::new(MenuState::default());
+
+        let with_old_dates = HarnessSnapshot {
+            status: HarnessStatus::Stopped,
+            version: None,
+            pid: None,
+            last_error: None,
+            recent_versions: vec![RecentVersion {
+                version: "0.2.0-rc.2".to_owned(),
+                installed_at: Some("2026-09-29T09:56:27.792Z".to_owned()),
+            }],
+        };
+        assert!(runtime.update_library(&with_old_dates));
+
+        let with_new_dates = HarnessSnapshot {
+            recent_versions: vec![RecentVersion {
+                version: "0.2.0-rc.2".to_owned(),
+                installed_at: Some("2026-10-07T00:00:00.000Z".to_owned()),
+            }],
+            ..with_old_dates.clone()
+        };
+        assert!(
+            !runtime.update_library(&with_new_dates),
+            "a date-only change is not visible in the menu, so it must not rebuild"
+        );
+    }
+
+    #[test]
+    fn update_snapshot_applies_both_guards_even_when_only_one_moved() {
+        // The failure this prevents: a caller using `update_harness` alone would miss
+        // a library change entirely - the submenu would stay stale with no log line,
+        // which is 2B's version of the "computed but never applied" bug.
+        let runtime = MenuRuntime::new(MenuState::default());
+
+        let baseline = HarnessSnapshot {
+            status: HarnessStatus::Stopped,
+            version: None,
+            pid: None,
+            last_error: None,
+            recent_versions: Vec::new(),
+        };
+        assert!(runtime.update_snapshot(&baseline), "the first snapshot is a change");
+        assert!(!runtime.update_snapshot(&baseline), "the same snapshot is not a change");
+
+        // A library change with NO harness change.
+        let library_moved = HarnessSnapshot {
+            recent_versions: vec![RecentVersion::bare("0.2.0-rc.2")],
+            ..baseline.clone()
+        };
+        assert!(
+            runtime.update_snapshot(&library_moved),
+            "a library-only change must be reported"
+        );
+        assert_eq!(runtime.snapshot().recent_versions.len(), 1);
+
+        // Both moving at once: neither update may be skipped by short-circuiting.
+        let both = HarnessSnapshot {
+            status: HarnessStatus::Running,
+            version: Some("0.2.0-rc.2".to_owned()),
+            pid: Some(4242),
+            last_error: None,
+            recent_versions: vec![RecentVersion::bare("0.2.0-rc.2"), RecentVersion::bare("0.2.0-rc.1")],
+        };
+        assert!(runtime.update_snapshot(&both));
+        let state = runtime.snapshot();
+        assert_eq!(state.harness_status, HarnessStatus::Running);
+        assert_eq!(state.harness_pid, Some(4242));
+        assert_eq!(
+            state.recent_versions.len(),
+            2,
+            "the library must have been applied even though the harness changed too"
+        );
+    }
+
+    #[test]
+    fn the_status_payload_populates_the_version_list() {
+        let payload = serde_json::json!({
+            "status": "running",
+            "version": "0.2.0-rc.2",
+            "pid": 4242,
+            "recentVersions": [
+                { "version": "0.2.0-rc.2", "state": "installed", "installedAt": "2026-10-06T18:37:06.147Z" },
+                { "version": "0.2.0-rc.1", "state": "installed", "installedAt": "2026-10-06T18:36:02.227Z" },
+                { "version": "0.1.9", "state": "partial", "installedAt": null }
+            ]
+        });
+
+        let snapshot = snapshot_from_status_payload(&payload);
+        assert_eq!(snapshot.recent_versions.len(), 3);
+        assert_eq!(snapshot.recent_versions[0].version, "0.2.0-rc.2");
+        assert_eq!(
+            snapshot.recent_versions[0].installed_at.as_deref(),
+            Some("2026-10-06T18:37:06.147Z")
+        );
+        assert_eq!(
+            snapshot.recent_versions[2].installed_at,
+            None,
+            "a null date is None, not the string \"null\""
+        );
+
+        // A JUNK LIST MUST NOT COST THE USER THE STATUS LABEL. This is the menu's
+        // primary information; an unreadable version list degrades to empty.
+        for junk in [
+            serde_json::json!({ "status": "running" }),
+            serde_json::json!({ "status": "running", "recentVersions": "not an array" }),
+            serde_json::json!({ "status": "running", "recentVersions": [1, 2, 3] }),
+            serde_json::json!({ "status": "running", "recentVersions": [{ "installedAt": "x" }] }),
+        ] {
+            let degraded = snapshot_from_status_payload(&junk);
+            assert!(
+                degraded.recent_versions.is_empty(),
+                "junk must degrade to an empty list: {junk}"
+            );
+            assert_eq!(
+                degraded.status,
+                HarnessStatus::Running,
+                "the status must survive a junk version list: {junk}"
+            );
+        }
+
+        // An entry with a blank version is dropped rather than rendered as `v`.
+        let blank = snapshot_from_status_payload(&serde_json::json!({
+            "status": "running",
+            "recentVersions": [{ "version": "   " }, { "version": "0.2.0-rc.2" }]
+        }));
+        assert_eq!(blank.recent_versions.len(), 1);
+        assert_eq!(blank.recent_versions[0].version, "0.2.0-rc.2");
+    }
+
+    #[test]
+    fn a_version_list_change_declines_the_status_only_fast_path() {
+        // The cadence closure, asserted rather than assumed. `status_only_change`
+        // compares the ENTIRE plan, so a version-list difference must make it return
+        // `None` - which routes the rebuild to the full structural path.
+        let base = state_for("recent-versions");
+        let installed = menu_plan(&base, TargetOs::Windows);
+
+        let moved_library = MenuState {
+            recent_versions: vec![RecentVersion::bare("9.9.9")],
+            ..base.clone()
+        };
+        let candidate = menu_plan(&moved_library, TargetOs::Windows);
+
+        assert_eq!(
+            status_only_change(&installed, &candidate),
+            None,
+            "a version-list change must NOT take the 0 ms fast path"
+        );
+
+        // The converse, so the fast path is still reachable at all: a status-label
+        // change with the SAME list is the case the fast path exists for.
+        let status_moved = MenuState {
+            harness_status: HarnessStatus::Starting,
+            ..base.clone()
+        };
+        assert!(
+            status_only_change(&installed, &menu_plan(&status_moved, TargetOs::Windows)).is_some(),
+            "a status-only change must still be detected"
+        );
+    }
+
+    #[test]
+    fn a_switch_prefers_the_shell_error_over_a_generic_message() {
+        // THE DEAD-SIDECAR CASE (Q91). The user must see a specific reason, not a
+        // silent no-op and not a generic failure. The shell's recorded startup error
+        // is the real cause (a missing sidecar/index.js, for example), which is why
+        // it is preferred over "no port yet".
+        let unavailable = switch_dispatch("0.2.0-rc.2", None, None);
+        match unavailable {
+            SwitchDispatch::Unavailable(message) => {
+                assert!(message.contains("0.2.0-rc.2"), "{message}");
+                assert!(
+                    message.contains("not reported a port yet"),
+                    "a sidecar that never came up must say so: {message}"
+                );
+                assert!(message.contains("launcher log"), "{message}");
+            }
+            other => panic!("a missing port must refuse, not dispatch: {other:?}"),
+        }
+
+        let with_error = switch_dispatch(
+            "0.2.0-rc.2",
+            None,
+            Some("Could not find sidecar/index.js. Searched, starting from the running executable: ..."),
+        );
+        match with_error {
+            SwitchDispatch::Unavailable(message) => {
+                assert!(
+                    message.contains("Could not find sidecar/index.js"),
+                    "the shell's real reason must be shown: {message}"
+                );
+                assert!(
+                    !message.contains("not reported a port yet"),
+                    "the generic message must not replace the real cause: {message}"
+                );
+            }
+            other => panic!("a recorded shell error must refuse: {other:?}"),
+        }
+
+        // A blank error is treated as no error, so the message is not left dangling.
+        let blank = switch_dispatch("0.2.0-rc.2", None, Some("   "));
+        assert!(matches!(blank, SwitchDispatch::Unavailable(message) if message.contains("not reported")));
+    }
+
+    #[test]
+    fn a_switch_with_a_live_sidecar_dispatches_the_versioned_route() {
+        let dispatch = switch_dispatch("0.2.0-rc.2", Some(54321), None);
+        assert_eq!(
+            dispatch,
+            SwitchDispatch::Dispatch("/versions/switch?version=0.2.0-rc.2".to_owned()),
+            "the route must match the sidecar's, including the query form"
+        );
+
+        // A build-metadata version keeps its `+`, because `URLSearchParams` would read
+        // a raw `+` as a space and the sidecar would refuse a version that is correct.
+        let plus = switch_dispatch("1.0.0+build.5", Some(1), None);
+        assert_eq!(
+            plus,
+            SwitchDispatch::Dispatch("/versions/switch?version=1.0.0+build.5".to_owned()),
+            "the shell passes the version through; the sidecar decodes it"
+        );
+    }
+
+    #[test]
+    fn a_switch_refuses_a_version_that_could_not_name_a_directory() {
+        // Defense in depth: the sidecar validates and is the authority. This copy
+        // exists so a malformed menu id never becomes an HTTP request, and so the user
+        // gets the reason instead of a 400 from a service they did not know was
+        // involved.
+        for hostile in [
+            "../../evil",
+            "next",
+            "latest",
+            "1.x",
+            "^1.2.3",
+            "1.2",
+            "1.2.3.4",
+            "",
+            "1.2.3-",
+            "1.2.3+",
+            "1.2.3 ",
+        ] {
+            let dispatch = switch_dispatch(hostile, Some(1), None);
+            assert!(
+                matches!(dispatch, SwitchDispatch::Unavailable(_)),
+                "{hostile:?} must be refused: {dispatch:?}"
+            );
+        }
+
+        // And the versions it must accept, including every real shape this project has
+        // seen plus build metadata.
+        for good in [
+            "0.2.0-rc.1",
+            "0.2.0-rc.2",
+            "0.2.1-alpha.1",
+            "1.2.3",
+            "1.2.3-alpha.10",
+            "1.2.3+build.5",
+            "1.2.3-rc.1+build.5",
+        ] {
+            assert!(
+                matches!(switch_dispatch(good, Some(1), None), SwitchDispatch::Dispatch(_)),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_switch_outcome_message_distinguishes_the_three_shapes() {
+        // 202 is "accepted", NOT "switched": the boot takes minutes and the message
+        // must not claim it finished.
+        let accepted = crate::ProxiedResponse {
+            code: 202,
+            data: serde_json::json!({ "busy": true, "kind": "switch", "version": "0.2.0-rc.2" }),
+            error: None,
+            shell_error: None,
+        };
+        let message = switch_outcome_message("0.2.0-rc.2", &accepted);
+        assert!(message.contains("Switching to v0.2.0-rc.2"), "{message}");
+        assert!(
+            !message.contains("Switched"),
+            "an accepted switch must not be reported as finished: {message}"
+        );
+        assert!(message.contains("few minutes"), "{message}");
+
+        // A refusal carries the sidecar's OWN explanation, which is more specific than
+        // anything the shell could invent (another operation in flight, or the library
+        // locked by another process).
+        let refused = crate::ProxiedResponse {
+            code: 409,
+            data: serde_json::json!({ "error": "library-locked", "message": "Another version library operation is in progress (pid 4242 since ...)" }),
+            error: None,
+            shell_error: None,
+        };
+        let message = switch_outcome_message("0.2.0-rc.1", &refused);
+        assert!(message.contains("Could not switch to v0.2.0-rc.1"), "{message}");
+        assert!(message.contains("pid 4242"), "the sidecar's wording must survive: {message}");
+
+        // A transport failure, with and without the shell's own reason.
+        let unreachable = crate::ProxiedResponse {
+            code: 0,
+            data: serde_json::Value::Null,
+            error: Some("Could not reach the DSH-Dock core on 127.0.0.1:54321".to_owned()),
+            shell_error: None,
+        };
+        let message = switch_outcome_message("0.2.0-rc.2", &unreachable);
+        assert!(message.contains("Could not start switching"), "{message}");
+        assert!(!message.contains("()"), "no dangling parentheses: {message}");
+
+        let with_shell = crate::ProxiedResponse {
+            shell_error: Some("Could not find sidecar/index.js".to_owned()),
+            ..unreachable
+        };
+        let message = switch_outcome_message("0.2.0-rc.2", &with_shell);
+        assert!(message.contains("Could not find sidecar/index.js"), "{message}");
+
+        // An unexplained non-2xx must still say something specific.
+        let silent = crate::ProxiedResponse {
+            code: 500,
+            data: serde_json::Value::Null,
+            error: None,
+            shell_error: None,
+        };
+        let message = switch_outcome_message("0.2.0-rc.2", &silent);
+        assert!(message.contains("HTTP 500"), "{message}");
+    }
+
+    #[test]
+    fn every_rebuild_reason_goes_through_the_one_set_menu_call_site() {
+        // THE WORKER BOUNDARY, PINNED AS FAR AS A UNIT TEST CAN. `set_menu` is
+        // app-wide and must only ever be called from `rebuild_menu`, which is
+        // main-thread work. The switch worker deliberately does NOT touch a menu: it
+        // performs the HTTP call and then marshals back with `on_main`, which calls
+        // `request_rebuild`. This asserts there is exactly ONE production call site,
+        // so a future edit that installs a menu from a worker shows up here.
+        let source = include_str!("menu.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("menu.rs has a non-test section");
+
+        let app_wide: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("if let Err(error) = app.set_menu(") || line.starts_with("app.set_menu("))
+            .collect();
+        assert_eq!(
+            app_wide.len(),
+            1,
+            "there must be exactly one app-wide set_menu call site: {app_wide:?}"
+        );
+
+        // The window-scoped clear is the other one, and it is on a WINDOW, not the
+        // app - which is why it is not counted above.
+        assert!(
+            production.contains("window.set_menu(empty)"),
+            "the wizard's menu clear must stay window-scoped"
+        );
+    }
+
+    #[test]
+    fn the_switch_version_predicate_agrees_with_the_id_round_trip() {
+        // THE CROSS-MODULE PIN, INSIDE THE SHELL (Q71). Two pieces of shell code now
+        // decide whether a string is an exact version: this predicate, added in 7b so a
+        // malformed menu id never becomes an HTTP request, and
+        // `MenuAction::from_id`, which RECONSTRUCTS the action from the id the submenu
+        // built. If they disagreed, a menu item could exist whose own click did not
+        // round-trip - which the existing `every_action_id_in_every_plan_round_trips`
+        // test would catch only for versions the FIXTURES happen to contain. This walks
+        // a corpus instead, so the two cannot drift on a version nobody thought to
+        // write a fixture for.
+        //
+        // NOT a parity check with the sidecar. The sidecar's `isSafeVersionName` is the
+        // authority and refuses a superset of what this predicate allows; that
+        // relationship is asserted on the sidecar side, where the authority lives.
+        let corpus = [
+            "0.2.0-rc.1",
+            "0.2.0-rc.2",
+            "0.2.1-alpha.1",
+            "1.2.3",
+            "1.2.3-alpha.10",
+            "1.2.3+build.5",
+            "1.2.3-rc.1+build.5",
+            "0.0.1-rc.1",
+            "10.20.30",
+            "../../evil",
+            "1.0.0/../evil",
+            "next",
+            "latest",
+            "1.x",
+            "^1.2.3",
+            "1.2",
+            "1.2.3.4",
+            "1.2.3-",
+            "1.2.3+",
+            "1.2.3 ",
+            "1.2.3-rc.1+",
+            "v1.2.3",
+        ];
+
+        for version in corpus {
+            let predicate = is_switchable_version(version);
+            let id = format!("{ID_HARNESS_RECENT_PREFIX}{version}");
+            let round_trips = matches!(
+                MenuAction::from_id(&id),
+                Some(MenuAction::SwitchVersion(_))
+            );
+            assert_eq!(
+                predicate, round_trips,
+                "{version:?}: is_switchable_version={predicate} but id round-trip={round_trips}"
+            );
+
+            // And the predicate must not be vacuously permissive: a version it accepts
+            // must build a route the sidecar could serve.
+            if predicate {
+                match switch_dispatch(version, Some(1), None) {
+                    SwitchDispatch::Dispatch(path) => assert_eq!(
+                        path,
+                        format!("/versions/switch?version={version}"),
+                        "{version:?} built an unexpected route"
+                    ),
+                    other => panic!("{version:?} was accepted but not dispatched: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_library_rebuild_still_clears_the_wizard_window_menu() {
+        // The re-verification the phase asked for. `rebuild_menu` re-clears the
+        // wizard's menu after EVERY install, and 2B adds a rebuild reason that fires
+        // while the wizard can legitimately be open - a first-run install completes
+        // and the recent-versions list changes. The guard is unconditional (not
+        // matched on `reason`), which is what makes it cover the new reason for free;
+        // this pins that it is not behind a `reason` check.
+        let source = include_str!("menu.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("menu.rs has a non-test section");
+
+        let body = {
+            let start = production
+                .find("pub fn rebuild_menu<R: Runtime>")
+                .expect("rebuild_menu exists");
+            let rest = &production[start..];
+            let end = rest.find("\n}\n").expect("rebuild_menu ends");
+            &rest[..end]
+        };
+
+        assert!(
+            body.contains("clear_welcome_menu(app, \"rebuild\")"),
+            "every rebuild must re-clear the wizard's menu"
+        );
+        assert!(
+            !body.contains("match reason")
+                && !body.contains("if reason ==")
+                && !body.contains("RebuildReason::Poll => clear_welcome_menu"),
+            "the clear must not be conditional on the rebuild reason, or a new reason \
+             would silently skip it"
+        );
     }
 }
