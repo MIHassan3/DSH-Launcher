@@ -15,6 +15,8 @@
 >
 > The premise of this project no longer exists. It is archived here as a record of the work, not as a maintained tool.
 >
+> **Engineering record:** [`docs/stoppingNote.md`](docs/stoppingNote.md) — what was built, what was verified at close, the known defects at halt, and what remained on the plan.
+>
 > ---
 
 ## What was built
