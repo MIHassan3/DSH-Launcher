@@ -1,3 +1,40 @@
+# DSH-Dock
+
+> ## ⚠️ Development Stopped — 2026-10-10
+>
+> **This project is no longer under active development.**
+>
+> DSH-Dock was a third-party desktop launcher for the DeepSeek Harness, built to solve one problem: running the Harness without touching a terminal.
+>
+> On **2026-09-30**, DeepSeek released an **official desktop application for the DeepSeek Harness** for Windows and macOS. It does what this project set out to do — one-click launch, background operation, local file access, auto-update — with first-party support.
+>
+> **Use the official app instead:**
+>
+> - Official page: https://www.deepseek.com/en/harness/
+> - Windows 10+ and macOS (Apple Silicon) installers are available directly from DeepSeek.
+>
+> The premise of this project no longer exists. It is archived here as a record of the work, not as a maintained tool.
+>
+> ---
+
+## What was built
+
+DSH-Dock reached a functional state across Phases 0–1, Pause 3 (native menu bar), Pause 4 (first-run wizard), and Phase 2A (version library backend — committed as `075a897`). Phase 2B (version switching, registry routes, minimal Version Manager UI, menu dispatch) was **in progress when development stopped** — the code is present in the final commit but was not fully verified.
+
+## Known issues at halt
+
+- **Menu lifecycle regression:** after a version switch, the harness window's menu bar does not reappear. Introduced during Phase 2B Step 7b/8 work and not fixed before the project stopped.
+- **Running-version checkmark:** the Recent Versions submenu checkmark was implemented but not confirmed working in the harness window, likely the same root cause as the menu regression.
+- **Partial-tree and failed-switch paths:** implemented and unit-tested, not exercised in a live build.
+
+## Technical summary
+
+Tauri v2 (Rust shell) + Node.js sidecar + Svelte 5 frontend. Version library with staged-rename installs, an advisory catalogue, install-tree validation, and a library lock. Four-layer architecture: thin shell, smart core, opaque harness, local version store.
+
+See `docs/PROJECT_DSH-DOCK.md` (v2.7.0) for the full framework specification.
+
+---
+
 <p align="center">
   <img src="docs/assets/icon.ico" alt="DSH-Dock icon" width="120" height="120">
 </p>
